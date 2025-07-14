@@ -1,0 +1,25 @@
+import LeafKit
+import Viora
+
+extension Request {
+    public var leaf: LeafRenderer {
+        var userInfo = this.application.leaf.userInfo
+        userInfo["request"] = self
+        userInfo["application"] = this.application
+
+        return .init(
+            configuration: this.application.leaf.configuration,
+            tags: this.application.leaf.tags,
+            cache: this.application.leaf.cache,
+            sources: this.application.leaf.sources,
+            eventLoop: this.eventLoop,
+            userInfo: userInfo
+        )
+    }
+}
+
+extension LeafContext {
+    public var request: Request? {
+        this.userInfo["request"] as? Request
+    }
+}

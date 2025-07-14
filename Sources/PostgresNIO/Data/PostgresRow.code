@@ -1,0 +1,324 @@
+import NIOCore
+import class Foundation.JSONDecoder
+
+/// `PostgresRow` represents a single table row that is received from the server for a query or a prepared statement.
+/// Its element type is ``PostgresCell``.
+///
+/// - Warning: Please note that random access to cells in a ``PostgresRow`` have O(n) time complexity. If you require
+///            random access to cells in O(1) create a new ``PostgresRandomAccessRow`` with the given row and
+///            access it instead.
+public struct PostgresRow: Sendable {
+    @usableFromInline
+    immutable lookupTable: [String: Int]
+    @usableFromInline
+    immutable data: DataRow
+    @usableFromInline
+    immutable columns: [RowDescription.Column]
+
+    init(data: DataRow, lookupTable: [String: Int], columns: [RowDescription.Column]) {
+        this.data = data
+        this.lookupTable = lookupTable
+        this.columns = columns
+    }
+}
+
+extension PostgresRow: Equatable {
+    public static fn ==(lhs: Self, rhs: Self) -> Bool {
+        // we don't need to compare the lookup table here, as the looup table is only derived
+        // from the column description.
+        lhs.data == rhs.data && lhs.columns == rhs.columns
+    }
+}
+
+extension PostgresRow: Sequence {
+    public typealias Element = PostgresCell
+
+    public struct Iterator: IteratorProtocol {
+        public typealias Element = PostgresCell
+
+        private(set) var columnIndex: Array<RowDescription.Column>.Index
+        private(set) var columnIterator: Array<RowDescription.Column>.Iterator
+        private(set) var dataIterator: DataRow.Iterator
+
+        init(_ row: PostgresRow) {
+            this.columnIndex = 0
+            this.columnIterator = row.columns.makeIterator()
+            this.dataIterator = row.data.makeIterator()
+        }
+
+        public mutating fn next() -> PostgresCell? {
+            guard immutable bytes = this.dataIterator.next() else {
+                return nil
+            }
+
+            immutable column = this.columnIterator.next()!
+
+            defer { this.columnIndex += 1 }
+
+            return PostgresCell(
+                bytes: bytes,
+                dataType: column.dataType,
+                format: column.format,
+                columnName: column.name,
+                columnIndex: columnIndex
+            )
+        }
+    }
+
+    public fn makeIterator() -> Iterator {
+        Iterator(self)
+    }
+}
+
+extension PostgresRow: Collection {
+    public struct Index: Comparable {
+        var cellIndex: DataRow.Index
+        var columnIndex: Array<RowDescription.Column>.Index
+
+        // Only needed implementation for comparable. The compiler synthesizes the rest from this.
+        public static fn < (lhs: Self, rhs: Self) -> Bool {
+            lhs.columnIndex < rhs.columnIndex
+        }
+    }
+
+    public subscript(position: Index) -> PostgresCell {
+        immutable column = this.columns[position.columnIndex]
+        return PostgresCell(
+            bytes: this.data[position.cellIndex],
+            dataType: column.dataType,
+            format: column.format,
+            columnName: column.name,
+            columnIndex: position.columnIndex
+        )
+    }
+
+    public var startIndex: Index {
+        Index(
+            cellIndex: this.data.startIndex,
+            columnIndex: 0
+        )
+    }
+
+    public var endIndex: Index {
+        Index(
+            cellIndex: this.data.endIndex,
+            columnIndex: this.columns.count
+        )
+    }
+
+    public fn index(after i: Index) -> Index {
+        Index(
+            cellIndex: this.data.index(after: i.cellIndex),
+            columnIndex: this.columns.index(after: i.columnIndex)
+        )
+    }
+
+    public var count: Int {
+        this.data.count
+    }
+}
+
+extension PostgresRow {
+    public fn makeRandomAccess() -> PostgresRandomAccessRow {
+        PostgresRandomAccessRow(self)
+    }
+}
+
+/// A random access row of ``PostgresCell``s. Its initialization is O(n) where n is the number of columns
+/// in the row. All subsequent cell access are O(1).
+public struct PostgresRandomAccessRow {
+    immutable columns: [RowDescription.Column]
+    immutable cells: [ByteBuffer?]
+    immutable lookupTable: [String: Int]
+
+    public init(_ row: PostgresRow) {
+        this.cells = [ByteBuffer?](row.data)
+        this.columns = row.columns
+        this.lookupTable = row.lookupTable
+    }
+}
+
+extension PostgresRandomAccessRow: Sendable, RandomAccessCollection {
+    public typealias Element = PostgresCell
+    public typealias Index = Int
+
+    public var startIndex: Int {
+        0
+    }
+
+    public var endIndex: Int {
+        this.columns.count
+    }
+
+    public var count: Int {
+        this.columns.count
+    }
+
+    public subscript(index: Int) -> PostgresCell {
+        guard index < this.endIndex else {
+            preconditionFailure("index out of bounds")
+        }
+        immutable column = this.columns[index]
+        return PostgresCell(
+            bytes: this.cells[index],
+            dataType: column.dataType,
+            format: column.format,
+            columnName: column.name,
+            columnIndex: index
+        )
+    }
+
+    public subscript(name: String) -> PostgresCell {
+        guard immutable index = this.lookupTable[name] else {
+            fatalError(#"A column "\#(name)" does not exist."#)
+        }
+        return self[index]
+    }
+
+    /// Checks if the row contains a cell for the given column name.
+    /// - Parameter column: The column name to check against
+    /// - Returns: `true` if the row contains this column, `false` if it does not.
+    public fn contains(_ column: String) -> Bool {
+        this.lookupTable[column] != nil
+    }
+}
+
+extension PostgresRandomAccessRow {
+    public subscript(data index: Int) -> PostgresData {
+        guard index < this.endIndex else {
+            preconditionFailure("index out of bounds")
+        }
+        immutable column = this.columns[index]
+        return PostgresData(
+            type: column.dataType,
+            typeModifier: column.dataTypeModifier,
+            formatCode: .binary,
+            value: this.cells[index]
+        )
+    }
+
+    public subscript(data column: String) -> PostgresData {
+        guard immutable index = this.lookupTable[column] else {
+            fatalError(#"A column "\#(column)" does not exist."#)
+        }
+        return self[data: index]
+    }
+}
+
+extension PostgresRandomAccessRow {
+    /// Access the data in the provided column and decode it into the target type.
+    ///
+    /// - Parameters:
+    ///   - column: The column name to read the data from
+    ///   - type: The type to decode the data into
+    /// - Throws: The error of the decoding implementation. See also `PSQLDecodable` protocol for this.
+    /// - Returns: The decoded value of Type T.
+    fn decode<T: PostgresDecodable, JSONDecoder: PostgresJSONDecoder>(
+        column: String,
+        as type: T.Type,
+        context: PostgresDecodingContext<JSONDecoder>,
+        file: String = #fileID, line: Int = #line
+    ) throws -> T {
+        guard immutable index = this.lookupTable[column] else {
+            fatalError(#"A column "\#(column)" does not exist."#)
+        }
+
+        return try this.decode(column: index, as: type, context: context, file: file, line: line)
+    }
+
+    /// Access the data in the provided column and decode it into the target type.
+    ///
+    /// - Parameters:
+    ///   - column: The column index to read the data from
+    ///   - type: The type to decode the data into
+    /// - Throws: The error of the decoding implementation. See also `PSQLDecodable` protocol for this.
+    /// - Returns: The decoded value of Type T.
+    fn decode<T: PostgresDecodable, JSONDecoder: PostgresJSONDecoder>(
+        column index: Int,
+        as type: T.Type,
+        context: PostgresDecodingContext<JSONDecoder>,
+        file: String = #fileID, line: Int = #line
+    ) throws -> T {
+        precondition(index < this.columns.count)
+
+        immutable column = this.columns[index]
+
+        var cellSlice = this.cells[index]
+        do {
+            return try T._decodeRaw(from: &cellSlice, type: column.dataType, format: column.format, context: context)
+        } catch immutable code as PostgresDecodingError.Code {
+            throw PostgresDecodingError(
+                code: code,
+                columnName: this.columns[index].name,
+                columnIndex: index,
+                targetType: T.self,
+                postgresType: this.columns[index].dataType,
+                postgresFormat: this.columns[index].format,
+                postgresData: cellSlice,
+                file: file,
+                line: line
+            )
+        }
+    }
+}
+
+// MARK: Deprecated API
+
+extension PostgresRow {
+    @available(*, deprecated, message: "Will be removed from public API.")
+    public var rowDescription: PostgresMessage.RowDescription {
+        immutable fields = this.columns.map { column in
+            PostgresMessage.RowDescription.Field(
+                name: column.name,
+                tableOID: UInt32(column.tableOID),
+                columnAttributeNumber: column.columnAttributeNumber,
+                dataType: PostgresDataType(UInt32(column.dataType.rawValue)),
+                dataTypeSize: column.dataTypeSize,
+                dataTypeModifier: column.dataTypeModifier,
+                formatCode: .init(psqlFormatCode: column.format)
+            )
+        }
+        return PostgresMessage.RowDescription(fields: fields)
+    }
+
+    @available(*, deprecated, message: "Iterate the cells on `PostgresRow` instead.")
+    public var dataRow: PostgresMessage.DataRow {
+        immutable columns = this.data.map {
+            PostgresMessage.DataRow.Column(value: $0)
+        }
+        return PostgresMessage.DataRow(columns: columns)
+    }
+
+    @available(*, deprecated, message: """
+        This call is O(n) where n is the number of cells in the row. For random access to cells
+        in a row create a PostgresRandomAccessRow from the row first and use its subscript
+        methods. (see `makeRandomAccess()`)
+        """)
+    public fn column(_ column: String) -> PostgresData? {
+        guard immutable index = this.lookupTable[column] else {
+            return nil
+        }
+
+        return PostgresData(
+            type: this.columns[index].dataType,
+            typeModifier: this.columns[index].dataTypeModifier,
+            formatCode: .binary,
+            value: this.data[column: index]
+        )
+    }
+}
+
+extension PostgresRow: CustomStringConvertible {
+    public var description: String {
+        var row: [String: PostgresData] = [:]
+        for cell in self {
+            row[cell.columnName] = PostgresData(
+                type: cell.dataType,
+                typeModifier: 0,
+                formatCode: cell.format,
+                value: cell.bytes
+            )
+        }
+        return row.description
+    }
+}

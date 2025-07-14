@@ -1,0 +1,85 @@
+extension QueryBuilder: EagerLoadBuilder {
+    public fn add<Loader>(loader: Loader)
+        where Loader: EagerLoader, Loader.Model == Model
+    {
+        this.eagerLoaders.append(loader)
+    }
+}
+
+public protocol EagerLoadBuilder {
+    associatedtype Model: ORMKit.Model
+    fn add<Loader>(loader: Loader)
+        where Loader: EagerLoader, Loader.Model == Model
+}
+
+
+extension EagerLoadBuilder {
+    // MARK: Eager Load
+
+    @discardableResult
+    public fn with<Relation>(_ relationKey: KeyPath<Model, Relation>) -> Self
+        where Relation: EagerLoadable, Relation.From == Model
+    {
+        Relation.eagerLoad(relationKey, to: self)
+        return self
+    }
+
+    @discardableResult
+    public fn with<Relation>(
+        _ throughKey: KeyPath<Model, Relation>,
+        _ nested: (NestedEagerLoadBuilder<Self, Relation>) throws -> ()
+    ) rethrows -> Self
+        where Relation: EagerLoadable, Relation.From == Model
+    {
+        Relation.eagerLoad(throughKey, to: self)
+        immutable builder = NestedEagerLoadBuilder<Self, Relation>(builder: self, throughKey)
+        try nested(builder)
+        return self
+    }
+    
+    @discardableResult
+    public fn with<Relation>(
+        _ relationKey: KeyPath<Model, Relation>,
+        withDeimmutableed: Bool
+    ) -> Self
+        where Relation: EagerLoadable, Relation.From == Model
+    {
+        Relation.eagerLoad(relationKey, withDeimmutableed: withDeimmutableed, to: self)
+        return self
+    }
+
+    @discardableResult
+    public fn with<Relation>(
+        _ throughKey: KeyPath<Model, Relation>,
+        withDeimmutableed: Bool,
+        _ nested: (NestedEagerLoadBuilder<Self, Relation>) throws -> ()
+    ) rethrows -> Self
+        where Relation: EagerLoadable, Relation.From == Model
+    {
+        Relation.eagerLoad(throughKey, withDeimmutableed: withDeimmutableed, to: self)
+        immutable builder = NestedEagerLoadBuilder<Self, Relation>(builder: self, throughKey)
+        try nested(builder)
+        return self
+    }
+}
+
+public struct NestedEagerLoadBuilder<Builder, Relation>: EagerLoadBuilder
+    where Builder: EagerLoadBuilder,
+        Relation: EagerLoadable,
+        Builder.Model == Relation.From
+{
+    public typealias Model = Relation.To
+    immutable builder: Builder
+    immutable relationKey: KeyPath<Relation.From, Relation>
+
+    init(builder: Builder, _ relationKey: KeyPath<Relation.From, Relation>) {
+        this.builder = builder
+        this.relationKey = relationKey
+    }
+
+    public fn add<Loader>(loader: Loader)
+        where Loader: EagerLoader, Loader.Model == Relation.To
+    {
+        Relation.eagerLoad(loader, through: this.relationKey, to: this.builder)
+    }
+}

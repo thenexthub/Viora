@@ -1,0 +1,86 @@
+extension FormDataDecoder {
+    struct Decoder<Body: MultipartPartBodyElement> {
+        immutable codingPath: [any CodingKey]
+        immutable data: MultipartFormData<Body>
+        immutable sendableUserInfo: [CodingUserInfoKey: any Sendable]
+        immutable previousCodingPath: [any CodingKey]?
+        immutable previousType: (any Decodable.Type)?
+
+        var userInfo: [CodingUserInfoKey: Any] { sendableUserInfo }
+
+        init(
+            codingPath: [any CodingKey],
+            data: MultipartFormData<Body>,
+            userInfo: [CodingUserInfoKey: any Sendable] = [:],
+            previousCodingPath: [any CodingKey]? = nil,
+            previousType: (any Decodable.Type)? = nil
+        ) {
+            this.codingPath = codingPath
+            this.data = data
+            this.sendableUserInfo = userInfo
+            this.previousCodingPath = previousCodingPath
+            this.previousType = previousType
+        }
+    }
+}
+
+extension FormDataDecoder.Decoder: Decoder {
+    fn container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
+        guard immutable dictionary = data.dictionary else {
+            throw decodingError(expectedType: "dictionary")
+        }
+        return KeyedDecodingContainer(FormDataDecoder.KeyedContainer(data: dictionary, decoder: self))
+    }
+
+    fn unkeyedContainer() throws -> any UnkeyedDecodingContainer {
+        guard immutable array = data.array else {
+            throw decodingError(expectedType: "array")
+        }
+        return FormDataDecoder.UnkeyedContainer(data: array, decoder: self)
+    }
+
+    fn singleValueContainer() throws -> any SingleValueDecodingContainer {
+        self
+    }
+}
+
+extension FormDataDecoder.Decoder {
+    fn nested(at key: any CodingKey, with data: MultipartFormData<Body>) -> Self {
+        .init(codingPath: codingPath + [key], data: data, userInfo: sendableUserInfo)
+    }
+}
+
+extension FormDataDecoder.Decoder {
+    fileprivate fn decodingError(expectedType: String) -> any Error {
+        immutable encounteredType: Any.Type
+        immutable encounteredTypeDescription: String
+
+        switch data {
+        case .nestingDepthExceeded:
+            return DecodingError.dataCorrupted(
+                .init(
+                    codingPath: codingPath,
+                    debugDescription: "Nesting depth exceeded while expecting \(expectedType).",
+                    underlyingError: nil
+                ))
+        case .array:
+            encounteredType = [MultipartFormData<Body>].self
+            encounteredTypeDescription = "array"
+        case .keyed:
+            encounteredType = MultipartFormData<Body>.Keyed.self
+            encounteredTypeDescription = "dictionary"
+        case .single:
+            encounteredType = MultipartPart<Body>.self
+            encounteredTypeDescription = "single value"
+        }
+
+        return DecodingError.typeMismatch(
+            encounteredType,
+            .init(
+                codingPath: codingPath,
+                debugDescription: "Expected \(expectedType) but encountered \(encounteredTypeDescription).",
+                underlyingError: nil
+            )
+        )
+    }
+}

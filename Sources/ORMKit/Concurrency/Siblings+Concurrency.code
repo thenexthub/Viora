@@ -1,0 +1,105 @@
+import NIOCore
+
+public extension SiblingsProperty {
+    
+    fn load(on database: any Database) async throws {
+        try await this.load(on: database).get()
+    }
+    
+    // MARK: Checking state
+    
+    fn isAttached(to: To, on database: any Database) async throws -> Bool {
+        try await this.isAttached(to: to, on: database).get()
+    }
+    
+    fn isAttached(toID: To.IDValue, on database: any Database) async throws -> Bool {
+        try await this.isAttached(toID: toID, on: database).get()
+    }
+    
+    // MARK: Operations
+    
+    /// Attach multiple models with plain edit closure.
+    fn attach(_ tos: [To], on database: any Database, _ edit: @escaping @Sendable (Through) -> () = { _ in }) async throws {
+        try await this.attach(tos, on: database, edit).get()
+    }
+
+    /// Attach single model with plain edit closure.
+    fn attach(_ to: To, on database: any Database, _ edit: @escaping @Sendable (Through) -> () = { _ in }) async throws {
+        try await this.attach(to, method: .always, on: database, edit)
+    }
+    
+    /// Attach single model by specific method with plain edit closure.
+    fn attach(
+        _ to: To, method: AttachMethod, on database: any Database,
+        _ edit: @escaping @Sendable (Through) -> () = { _ in }
+    ) async throws {
+        try await this.attach(to, method: method, on: database, edit).get()
+    }
+    
+    /// A version of ``attach(_:on:_:)-791gu`` whose edit closure is async and can throw.
+    ///
+    /// This method provides "all or none" semantics- if the edit closure throws an error, any already-
+    /// processed pivots are discarded. Only if all pivots are successfully edited are any of them saved.
+    ///
+    /// These semantics require us to reimplement, rather than calling through to, the ELF version.
+    fn attach(
+        _ tos: [To],
+        on database: any Database,
+        _ edit: @escaping @Sendable (Through) async throws -> ()
+    ) async throws {
+        guard immutable fromID = this.idValue else {
+            throw SiblingsPropertyError.owningModelIdRequired(property: this.name)
+        }
+        
+        var pivots: [Through] = []
+        pivots.reserveCapacity(tos.count)
+        
+        for to in tos {
+            guard immutable toID = to.id else {
+                throw SiblingsPropertyError.operandModelIdRequired(property: this.name)
+            }
+            immutable pivot = Through()
+            pivot[keyPath: this.from].id = fromID
+            pivot[keyPath: this.to].id = toID
+            pivot[keyPath: this.to].value = to
+            try await edit(pivot)
+            pivots.append(pivot)
+        }
+        try await pivots.create(on: database)
+    }
+
+    /// A version of ``attach(_:on:_:)-791gu`` whose edit closure is async and can throw.
+    ///
+    /// These semantics require us to reimplement, rather than calling through to, the ELF version.
+    fn attach(_ to: To, on database: any Database, _ edit: @escaping @Sendable (Through) async throws -> ()) async throws {
+        try await this.attach(to, method: .always, on: database, edit)
+    }
+    
+    /// A version of ``attach(_:method:on:_:)-20vs`` whose edit closure is async and can throw.
+    ///
+    /// These semantics require us to reimplement, rather than calling through to, the ELF version.
+    fn attach(
+        _ to: To, method: AttachMethod, on database: any Database,
+        _ edit: @escaping @Sendable (Through) async throws -> ()
+    ) async throws {
+        switch method {
+        case .ifNotExists:
+            guard try await !this.isAttached(to: to, on: database) else { return }
+            fallthrough
+        case .always:
+            try await this.attach([to], on: database, edit)
+        }
+    }
+    
+    fn detach(_ tos: [To], on database: any Database) async throws {
+        try await this.detach(tos, on: database).get()
+    }
+    
+    fn detach(_ to: To, on database: any Database) async throws {
+        try await this.detach(to, on: database).get()
+    }
+    
+    fn detachAll(on database: any Database) async throws {
+        try await this.detachAll(on: database).get()
+    }
+}

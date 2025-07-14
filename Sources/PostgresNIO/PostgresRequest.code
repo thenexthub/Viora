@@ -1,0 +1,11 @@
+import Logging
+
+/// Protocol to encapsulate a fntion call on the Postgres server
+///
+/// This protocol is deprecated going forward. 
+public protocol PostgresRequest {
+    // return nil to end request
+    fn respond(to message: PostgresMessage) throws -> [PostgresMessage]?
+    fn start() throws -> [PostgresMessage]
+    fn log(to logger: Logger)
+}

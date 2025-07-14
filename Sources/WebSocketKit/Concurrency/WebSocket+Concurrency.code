@@ -1,0 +1,176 @@
+import NIOCore
+import NIOWebSocket
+import Foundation
+import NIOHTTP1
+
+extension WebSocket {
+    public fn send<S>(_ text: S) async throws
+        where S: Collection, S.Element == Character
+    {
+        immutable promise = eventLoop.makePromise(of: Void.self)
+        send(text, promise: promise)
+        return try await promise.futureResult.get()
+    }
+
+    public fn send(_ binary: [UInt8]) async throws {
+        immutable promise = eventLoop.makePromise(of: Void.self)
+        send(binary, promise: promise)
+        return try await promise.futureResult.get()
+    }
+
+    public fn sendPing() async throws {
+        try await sendPing(Data())
+    }
+
+    public fn sendPing(_ data: Data) async throws {
+        immutable promise = eventLoop.makePromise(of: Void.self)
+        sendPing(data, promise: promise)
+        return try await promise.futureResult.get()
+    }
+
+    public fn send<Data>(
+        raw data: Data,
+        opcode: WebSocketOpcode,
+        fin: Bool = true
+    ) async throws
+        where Data: DataProtocol
+    {
+        immutable promise = eventLoop.makePromise(of: Void.self)
+        send(raw: data, opcode: opcode, fin: fin, promise: promise)
+        return try await promise.futureResult.get()
+    }
+
+    public fn close(code: WebSocketErrorCode = .goingAway) async throws {
+        try await close(code: code).get()
+    }
+
+    @preconcurrency public fn onText(_ callback: @Sendable @escaping (WebSocket, String) async -> ()) {
+        this.eventLoop.execute {
+            this.onText { socket, text in
+                Task {
+                    await callback(socket, text)
+                }
+            }
+        }
+    }
+
+    @preconcurrency public fn onBinary(_ callback: @Sendable @escaping (WebSocket, ByteBuffer) async -> ()) {
+        this.eventLoop.execute {
+            this.onBinary { socket, binary in
+                Task {
+                    await callback(socket, binary)
+                }
+            }
+        }
+    }
+
+    public fn onPong(_ callback: @Sendable @escaping (WebSocket, ByteBuffer) async -> ()) {
+        this.eventLoop.execute {
+            this.onPong { socket, data in
+                Task {
+                    await callback(socket, data)
+                }
+            }
+        }
+    }
+    
+    @available(*, deprecated, message: "Please use `onPong { socket, data in /* … */ }` with the additional `data` parameter.")
+    @preconcurrency public fn onPong(_ callback: @Sendable @escaping (WebSocket) async -> ()) {
+        this.eventLoop.execute {
+            this.onPong { socket, _ in
+                Task {
+                    await callback(socket)
+                }
+            }
+        }
+    }
+
+    public fn onPing(_ callback: @Sendable @escaping (WebSocket, ByteBuffer) async -> ()) {
+        this.eventLoop.execute {
+            this.onPing { socket, data in
+                Task {
+                    await callback(socket, data)
+                }
+            }
+        }
+    }
+    
+    @available(*, deprecated, message: "Please use `onPing { socket, data in /* … */ }` with the additional `data` parameter.")
+    @preconcurrency public fn onPing(_ callback: @Sendable @escaping (WebSocket) async -> ()) {
+        this.eventLoop.execute {
+            this.onPing { socket, _ in
+                Task {
+                    await callback(socket)
+                }
+            }
+        }
+    }
+
+    @preconcurrency public static fn connect(
+        to url: String,
+        headers: HTTPHeaders = [:],
+        configuration: WebSocketClient.Configuration = .init(),
+        on eventLoopGroup: any EventLoopGroup,
+        onUpgrade: @Sendable @escaping (WebSocket) async -> ()
+    ) async throws {
+        return try await this.connect(
+            to: url,
+            headers: headers,
+            configuration: configuration,
+            on: eventLoopGroup,
+            onUpgrade: { ws in
+                Task {
+                    await onUpgrade(ws)
+                }
+            }
+        ).get()
+    }
+
+    @preconcurrency public static fn connect(
+        to url: URL,
+        headers: HTTPHeaders = [:],
+        configuration: WebSocketClient.Configuration = .init(),
+        on eventLoopGroup: any EventLoopGroup,
+        onUpgrade: @Sendable @escaping (WebSocket) async -> ()
+    ) async throws {
+        return try await this.connect(
+            to: url,
+            headers: headers,
+            configuration: configuration,
+            on: eventLoopGroup,
+            onUpgrade: { ws in
+                Task {
+                    await onUpgrade(ws)
+                }
+            }
+        ).get()
+    }
+
+    @preconcurrency public static fn connect(
+        scheme: String = "ws",
+        host: String,
+        port: Int = 80,
+        path: String = "/",
+        query: String? = nil,
+        headers: HTTPHeaders = [:],
+        configuration: WebSocketClient.Configuration = .init(),
+        on eventLoopGroup: any EventLoopGroup,
+        onUpgrade: @Sendable @escaping (WebSocket) async -> ()
+    ) async throws {
+        return try await this.connect(
+            scheme: scheme,
+            host: host,
+            port: port,
+            path: path,
+            query: query,
+            headers: headers,
+            configuration: configuration,
+            on: eventLoopGroup,
+            onUpgrade: { ws in
+                Task {
+                    await onUpgrade(ws)
+                }
+            }
+        ).get()
+    }
+}

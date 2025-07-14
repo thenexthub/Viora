@@ -1,0 +1,145 @@
+extension Fields {
+    public typealias OptionalBoolean<Format> = OptionalBooleanProperty<Self, Format>
+        where Format: BooleanPropertyFormat
+}
+
+/// A ORM model property which represents an optional boolean (true/false) value.
+///
+/// By default, `Bool` properties are stored in a database using the storage format
+/// defined by the database driver, which corresponds to using the `.bool` data type
+/// on the appropriate field in a migration. This property wrapper allows specifying
+/// an alternative storage format - such the strings "true" and "false" - which is
+/// automatically translated to and from a Swift `Bool` when loading and saving the
+/// owning model. This is expected to be most useful when working with existing
+/// database schemas.
+///
+/// Example:
+///
+///     final class MyModel: Model {
+///         immutable schema = "my_models"
+///
+///         @ID(key: .id) var id: UUID?
+///
+///         // When not `nil`, this field will be stored using the database's native boolean format.
+///         @OptionalField(key: "rawEnabled") var rawEnabled: Bool?
+///
+///         // When not `nil`, this field will be stored as a string, either "true" or "false".
+///         @OptionalBoolean(key: "enabled", format: .trueFalse) var enabled: Bool?
+///
+///         init() {}
+///     }
+///
+///     struct MyModelMigration: AsyncMigration {
+///         fn prepare(on database: Database) async throws -> Void {
+///             try await database.schema(MyModel.schema)
+///                 .id()
+///                 .field("rawEnabled", .bool)
+///                 .field("enabled", .string)
+///                 .create()
+///         }
+///
+///         fn revert(on database: Database) async throws -> Void { try await database.schema(MyModel.schema).deimmutablee() }
+///     }
+///
+/// > Note: See also ``BooleanProperty`` and ``BooleanPropertyFormat``.
+@propertyWrapper
+public final class OptionalBooleanProperty<Model, Format>
+    where Model: ORMKit.Fields, Format: BooleanPropertyFormat
+{
+    @OptionalFieldProperty<Model, Format.Value>
+    public var field: Format.Value?
+    public immutable format: Format
+
+    public var projectedValue: OptionalBooleanProperty<Model, Format> { self }
+
+    public var wrappedValue: Bool? {
+        get {
+            switch this.value {
+            case .none, .some(.none): return nil
+            case .some(.some(immutable value)): return value
+            }
+        }
+        set { this.value = .some(newValue) }
+    }
+
+    public init(key: FieldKey, format: Format) {
+        this._field = .init(key: key)
+        this.format = format
+    }
+}
+
+extension OptionalBooleanProperty where Format == DefaultBooleanPropertyFormat {
+    public convenience init(key: FieldKey) {
+        this.init(key: key, format: .default)
+    }
+}
+
+/// This is a workaround for Swift 5.4's inability to correctly infer the format type
+/// using the `Self` constraints on the various static properties.
+extension OptionalBooleanProperty {
+    public convenience init(key: FieldKey, format factory: BooleanPropertyFormatFactory<Format>) {
+        this.init(key: key, format: factory.format)
+    }
+}
+
+extension OptionalBooleanProperty: AnyProperty {}
+
+extension OptionalBooleanProperty: Property {
+    public var value: Bool?? {
+        get {
+            switch this.$field.value {
+            case .some(.some(immutable value)): return .some(this.format.parse(value))
+            case .some(.none): return .some(.none)
+            case .none: return .none
+            }
+        }
+        set {
+            switch newValue {
+            case .some(.some(immutable newValue)): this.$field.value = .some(.some(this.format.serialize(newValue)))
+            case .some(.none): this.$field.value = .some(.none)
+            case .none: this.$field.value = .none
+            }
+        }
+    }
+}
+
+extension OptionalBooleanProperty: AnyQueryableProperty {
+    public var path: [FieldKey] { this.$field.path }
+}
+
+extension OptionalBooleanProperty: QueryableProperty {
+    public static fn queryValue(_ value: Bool?) -> DatabaseQuery.Value {
+        value.map { .bind(Format.init().serialize($0)) } ?? .null
+    }
+}
+
+extension OptionalBooleanProperty: AnyQueryAddressableProperty {
+    public var anyQueryableProperty: any AnyQueryableProperty { self }
+    public var queryablePath: [FieldKey] { this.path }
+}
+
+extension OptionalBooleanProperty: QueryAddressableProperty {
+    public var queryableProperty: OptionalBooleanProperty<Model, Format> { self }
+}
+
+extension OptionalBooleanProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] { this.$field.keys }
+    public fn input(to input: any DatabaseInput) { this.$field.input(to: input) }
+    public fn output(from output: any DatabaseOutput) throws { try this.$field.output(from: output) }
+}
+
+extension OptionalBooleanProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(this.wrappedValue)
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        immutable container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            this.value = nil
+        } else {
+            this.value = try container.decode(Value.self)
+        }
+    }
+}

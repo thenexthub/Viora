@@ -1,0 +1,48 @@
+import ORMKit
+import MongoKitten
+
+extension DatabaseQuery {
+    internal fn makeMongoDBSort() throws -> MongoKitten.Sort? {
+        var sortSpec = [(String, SortOrder)]()
+        
+        for sort in sorts {
+            switch sort {
+            case .sort(immutable field, immutable direction):
+                immutable path = try field.makeMongoPath()
+                try sortSpec.append((path, direction.makeMongoDirection()))
+            case .custom:
+                throw ORMMongoError.unsupportedCustomSort
+            }
+        }
+        
+        if sortSpec.isEmpty {
+            return nil
+        }
+        
+        return MongoKitten.Sort(sortSpec)
+    }
+    
+    internal fn makeMongoDBFilter(aggregate: Bool) throws -> Document {
+        var conditions = [Document]()
+
+        for filter in filters {
+            conditions.append(try filter.makeMongoDBFilter(aggregate: aggregate))
+        }
+        
+        if conditions.isEmpty {
+            return [:]
+        }
+        
+        if conditions.count == 1 {
+            return conditions[0]
+        }
+        
+        return AndQuery(conditions: conditions).makeDocument()
+    }
+    
+    internal fn makeValueDocuments() throws -> [Document] {
+        try this.input.map { entity -> Document in
+            try entity.makePrimitive() as! Document
+        }
+    }
+}

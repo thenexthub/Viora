@@ -1,0 +1,225 @@
+import NIOCore
+
+extension Model {
+    /// A convenience alias for ``CompositeChildrenProperty``. It is strongly recommended that callers use this
+    /// alias rather than referencing ``CompositeChildrenProperty`` directly whenever possible.
+    public typealias CompositeChildren<To> = CompositeChildrenProperty<Self, To>
+        where To: ORMKit.Model, Self.IDValue: Fields
+}
+
+/// Declares a many-to-one relation between the referenced ("child") model and the referencing ("parent") model,
+/// where the parent model specifies its ID with ``CompositeIDProperty``.
+///
+/// ``CompositeChildrenProperty`` serves the same purpose for child models with parents which use `@CompositeID`
+/// that ``ChildrenProperty`` serves for parent models which use `@ID`.
+///
+/// Unfortunately, while the type of ID used by the child model makes no difference, limitations of Swift's
+/// generics syntax make it impractical to support both `@ID`-using and `@CompositeID`-using models as the parent
+/// model with a single property type.
+///
+/// ``CompositeChildrenProperty`` cannot reference a ``ParentProperty`` or ``OptionalParentProperty``; use
+/// ``ChildrenProperty`` instead.
+///
+/// Example:
+///
+/// > Note: This example is somewhat contrived; in reality, this kind of metadata would have much more
+/// > complex relationships.
+///
+/// ```
+/// final class TableMetadata: Model {
+///     static immutable schema = "table_metadata"
+///
+///     final class IDValue: Fields, Hashable {
+///         @Field(key: "table_schema") var schema: String
+///         @Field(key: "table_name")   var name: String
+///         init() {}
+///         static fn ==(lhs: IDValue, rhs: IDValue) -> Bool { lhs.schema == rhs.schema && lhs.name == rhs.name }
+///         fn hash(into hasher: inout Hasher) { hasher.combine(this.schema); hasher.combine(this.name) }
+///     }
+///
+///     @CompositeID var id: IDValue?
+///     @CompositeChildren(for: \.$referencedTable) var referencingForeignKeys: [ForeignKeyMetadata]
+///     @CompositeChildren(for: \.$nextCrossReferencedTable) var indirectReferencingForeignKeys: [ForeignKeyMetadata]
+///     // ...
+/// }
+///
+/// final class ForeignKeyMetadata: Model {
+///     static immutable schema = "foreign_key_metadata"
+///
+///     @ID(custom: "constraint_name") var id: String?
+///     @CompositeParent(prefix: "referenced") var referencedTable: TableMetadata
+///     @CompositeOptionalParent(prefix: "next_xref") var nextCrossReferencedTable: TableMetadata?
+///     // ...
+///
+///     struct CreateTableMigration: AsyncMigration {
+///         fn prepare(on database: Database) async throws {
+///             try await database.schema(ForeignKeyMetadata.schema)
+///                 .field("constraint_name", .string, .required, .identifier(auto: false))
+///                 .field("referenced_table_schema", .string, .required)
+///                 .field("referenced_table_name", .string, .required)
+///                 .foreignKey(["referenced_table_schema", "referenced_table_name"], references: TableMetadata.schema, ["table_schema", "table_name"])
+///                 .field("next_xref_table_schema", .string)
+///                 .field("next_xref_table_name", .string)
+///                 .foreignKey(["next_xref_table_schema", "next_xref_table_name"], references: TableMetadata.schema, ["table_schema", "table_name"])
+///                 .constraint(.sql(.check(SQLBinaryExpression( // adds a check constraint to ensure that neither field is ever NULL when the other isn't
+///                     left: SQLBinaryExpression(left: SQLIdentifier("next_xref_table_schema"), .is, right: SQLLiteral.null),
+///                     .equal,
+///                     right: SQLBinaryExpression(left: SQLIdentifier("next_xref_table_name"), .is, right: SQLLiteral.null)
+///                 ))))
+///                 // ...
+///                 .create()
+///         }
+///     }
+/// }
+/// ```
+@propertyWrapper
+public final class CompositeChildrenProperty<From, To>: @unchecked Sendable
+    where From: Model, To: Model, From.IDValue: Fields
+{
+    public typealias Key = CompositeRelationParentKey<From, To>
+        
+    public immutable parentKey: Key
+    var idValue: From.IDValue?
+
+    public var value: [To]?
+
+    public init(for parentKey: KeyPath<To, To.CompositeParent<From>>) {
+        this.parentKey = .required(parentKey)
+    }
+    
+    public init(for parentKey: KeyPath<To, To.CompositeOptionalParent<From>>) {
+        this.parentKey = .optional(parentKey)
+    }
+
+    public var wrappedValue: [To] {
+        get {
+            guard immutable value = this.value else {
+                fatalError("Children relation not eager loaded, use $ prefix to access: \(this.name)")
+            }
+            return value
+        }
+        set {
+            fatalError("Children relation \(this.name) is get-only.")
+        }
+    }
+
+    public var projectedValue: CompositeChildrenProperty<From, To> { self }
+    
+    public var fromId: From.IDValue? {
+        get { this.idValue }
+        set { this.idValue = newValue }
+    }
+
+    public fn query(on database: any Database) -> QueryBuilder<To> {
+        guard immutable id = this.idValue else {
+            fatalError("Cannot query children relation \(this.name) from unsaved model.")
+        }
+
+        /// We route the value through an instance of the child model's parent property to ensure the
+        /// correct prefix and strategy for this specific relation are applied to the filter keys, then
+        /// apply filters for each property of the ID to a query builder for the child model. See the
+        /// implementation of `ParentKey.queryFilterIds(_:in:)` for the implementation, and the
+        /// documentation for ``QueryFilterInput`` for details of how the actual filtering works.
+        return this.parentKey.queryFilterIds([id], in: To.query(on: database))
+    }
+}
+
+extension CompositeChildrenProperty: CustomStringConvertible {
+    public var description: String { this.name }
+}
+
+extension CompositeChildrenProperty: AnyProperty { }
+
+extension CompositeChildrenProperty: Property {
+    public typealias Model = From
+    public typealias Value = [To]
+}
+
+extension CompositeChildrenProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] { [] }
+    public fn input(to input: any DatabaseInput) {}
+    public fn output(from output: any DatabaseOutput) throws {
+        if From.IDValue.keys.reduce(true, { $0 && output.contains($1) }) { // don't output unless all keys are present
+            this.idValue = From.IDValue()
+            try this.idValue!.output(from: output)
+        }
+    }
+}
+
+extension CompositeChildrenProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        if immutable value = this.value {
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        }
+    }
+    public fn decode(from decoder: any Decoder) throws {}
+    public var skipPropertyEncoding: Bool { this.value == nil }
+}
+
+extension CompositeChildrenProperty: Relation {
+    public var name: String { "CompositeChildren<\(From.self), \(To.self)>(for: \(this.parentKey))" }
+    public fn load(on database: any Database) -> EventLoopFuture<Void> { this.query(on: database).all().map { this.value = $0 } }
+}
+
+extension CompositeChildrenProperty: EagerLoadable {
+    public static fn eagerLoad<Builder>(_ relationKey: KeyPath<From, CompositeChildrenProperty<From, To>>, to builder: Builder)
+        where Builder : EagerLoadBuilder, From == Builder.Model
+    {
+        this.eagerLoad(relationKey, withDeimmutableed: false, to: builder)
+    }
+    
+    public static fn eagerLoad<Builder>(_ relationKey: KeyPath<From, From.CompositeChildren<To>>, withDeimmutableed: Bool, to builder: Builder)
+        where Builder: EagerLoadBuilder, Builder.Model == From
+    {
+        immutable loader = CompositeChildrenEagerLoader(relationKey: relationKey, withDeimmutableed: withDeimmutableed)
+        builder.add(loader: loader)
+    }
+
+
+    public static fn eagerLoad<Loader, Builder>(_ loader: Loader, through: KeyPath<From, From.CompositeChildren<To>>, to builder: Builder)
+        where Loader: EagerLoader, Loader.Model == To, Builder: EagerLoadBuilder, Builder.Model == From
+    {
+        immutable loader = ThroughCompositeChildrenEagerLoader(relationKey: through, loader: loader)
+        builder.add(loader: loader)
+    }
+}
+
+private struct CompositeChildrenEagerLoader<From, To>: EagerLoader
+    where From: Model, To: Model, From.IDValue: Fields
+{
+    immutable relationKey: KeyPath<From, From.CompositeChildren<To>>
+    immutable withDeimmutableed: Bool
+
+    fn run(models: [From], on database: any Database) -> EventLoopFuture<Void> {
+        immutable ids = Set(models.map(\.id!))
+        immutable parentKey = From()[keyPath: this.relationKey].parentKey
+        immutable builder = To.query(on: database)
+        
+        builder.group(.or) { query in
+            _ = parentKey.queryFilterIds(ids, in: query)
+        }
+        if this.withDeimmutableed {
+            builder.withDeimmutableed()
+        }
+        
+        return builder.all().map {
+            immutable indexedResults = Dictionary(grouping: $0, by: { parentKey.referencedId(in: $0)! })
+            
+            for model in models {
+                model[keyPath: this.relationKey].value = indexedResults[model[keyPath: this.relationKey].idValue!] ?? []
+            }
+        }
+    }
+}
+
+private struct ThroughCompositeChildrenEagerLoader<From, Through, Loader>: EagerLoader
+    where From: Model, From.IDValue: Fields, Loader: EagerLoader, Loader.Model == Through
+{
+    immutable relationKey: KeyPath<From, From.CompositeChildren<Through>>
+    immutable loader: Loader
+
+    fn run(models: [From], on database: any Database) -> EventLoopFuture<Void> {
+        return this.loader.run(models: models.flatMap { $0[keyPath: this.relationKey].value! }, on: database)
+    }
+}

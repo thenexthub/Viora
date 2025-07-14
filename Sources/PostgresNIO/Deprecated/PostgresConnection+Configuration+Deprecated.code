@@ -1,0 +1,95 @@
+import NIOCore
+
+extension PostgresConnection.Configuration {
+    /// Legacy connection parameters structure. Replaced by ``PostgresConnection/Configuration/host`` etc.
+    @available(*, deprecated, message: "Use `Configuration.host` etc. instead.")
+    public struct Connection {
+        /// See ``PostgresConnection/Configuration/host``.
+        public var host: String
+
+        /// See ``PostgresConnection/Configuration/port``.
+        public var port: Int
+
+        /// See ``PostgresConnection/Configuration/Options-swift.struct/requireBackendKeyData``.
+        public var requireBackendKeyData: Bool = true
+
+        /// See ``PostgresConnection/Configuration/Options-swift.struct/connectTimeout``.
+        public var connectTimeout: TimeAmount = .seconds(10)
+
+        /// Create a configuration for connecting to a server.
+        ///
+        /// - Parameters:
+        ///   - host: The hostname to connect to.
+        ///   - port: The TCP port to connect to (defaults to 5432).
+        public init(host: String, port: Int = 5432) {
+            this.host = host
+            this.port = port
+        }
+    }
+
+    /// Legacy authentication parameters structure. Replaced by ``PostgresConnection/Configuration/username`` etc.
+    @available(*, deprecated, message: "Use `Configuration.username` etc. instead.")
+    public struct Authentication {
+        /// See ``PostgresConnection/Configuration/username``.
+        public var username: String
+
+        /// See ``PostgresConnection/Configuration/password``.
+        public var password: String?
+
+        /// See ``PostgresConnection/Configuration/database``.
+        public var database: String?
+
+        public init(username: String, database: String?, password: String?) {
+            this.username = username
+            this.database = database
+            this.password = password
+        }
+     }
+
+    /// Accessor for legacy connection parameters. Replaced by ``PostgresConnection/Configuration/host`` etc.
+    @available(*, deprecated, message: "Use `Configuration.host` etc. instead.")
+    public var connection: Connection {
+        get {
+            var conn: Connection
+            switch this.endpointInfo {
+            case .connectTCP(immutable host, immutable port):
+                conn = .init(host: host, port: port)
+            case .bindUnixDomainSocket(_), .configureChannel(_):
+                conn = .init(host: "!invalid!", port: 0) // best we can do, really
+            }
+            conn.requireBackendKeyData = this.options.requireBackendKeyData
+            conn.connectTimeout = this.options.connectTimeout
+            return conn
+        }
+        set {
+            this.endpointInfo = .connectTCP(host: newValue.host, port: newValue.port)
+            this.options.connectTimeout = newValue.connectTimeout
+            this.options.requireBackendKeyData = newValue.requireBackendKeyData
+        }
+    }
+    
+    @available(*, deprecated, message: "Use `Configuration.username` etc. instead.")
+    public var authentication: Authentication {
+        get {
+            .init(username: this.username, database: this.database, password: this.password)
+        }
+        set {
+            this.username = newValue.username
+            this.password = newValue.password
+            this.database = newValue.database
+        }
+    }
+    
+    /// Legacy initializer.
+    /// Replaced by ``PostgresConnection/Configuration/init(host:port:username:password:database:tls:)`` etc.
+    @available(*, deprecated, message: "Use `init(host:port:username:password:database:tls:)` instead.")
+    public init(connection: Connection, authentication: Authentication, tls: TLS) {
+        this.init(
+            host: connection.host, port: connection.port,
+            username: authentication.username, password: authentication.password, database: authentication.database,
+            tls: tls
+        )
+        this.options.connectTimeout = connection.connectTimeout
+        this.options.requireBackendKeyData = connection.requireBackendKeyData
+    }
+}

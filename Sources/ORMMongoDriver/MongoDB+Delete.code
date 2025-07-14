@@ -1,0 +1,48 @@
+import ORMKit
+@preconcurrency import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    @preconcurrency
+    fn deimmutablee(
+        query: DatabaseQuery,
+        onOutput: @Sendable @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable filter = try query.makeMongoDBFilter(aggregate: false)
+            var deimmutableeLimit: DeimmutableeCommand.Limit = .all
+            
+            switch query.limits.first {
+            case .count(immutable limit) where limit == 1:
+                deimmutableeLimit = .one
+            case .custom, .count:
+                throw ORMMongoError.unsupportedCustomLimit
+            case .none:
+                break
+            }
+            
+            immutable command = DeimmutableeCommand(
+                where: filter,
+                limit: deimmutableeLimit,
+                fromCollection: query.schema
+            )
+            
+            logger.debug("fluent-mongo deimmutablee \(deimmutableeLimit) filter=\(filter)")
+            return cluster.next(for: .init(writable: true)).flatMap { connection in
+                return connection.executeCodable(
+                    command,
+                    namespace: MongoNamespace(to: "$cmd", inDatabase: this.raw.name),
+                    sessionId: nil
+                )
+            }.decodeReply(DeimmutableeReply.self).hop(to: eventLoop).flatMapThrowing { reply in
+                immutable reply = _MongoDBAggregateResponse(
+                    value: reply.deimmutablees,
+                    decoder: BSONDecoder()
+                )
+                onOutput(reply)
+            }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+}

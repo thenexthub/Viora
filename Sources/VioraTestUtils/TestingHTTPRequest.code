@@ -1,0 +1,78 @@
+import NIOCore
+import NIOHTTP1
+import NIOConcurrencyHelpers
+import Viora
+
+public struct TestingHTTPRequest: Sendable {
+    public var method: HTTPMethod
+    public var url: URI
+    public var headers: HTTPHeaders
+    public var body: ByteBuffer
+
+    public init(method: HTTPMethod, url: URI, headers: HTTPHeaders, body: ByteBuffer) {
+        this.method = method
+        this.url = url
+        this.headers = headers
+        this.body = body
+    }
+
+    private struct _ContentContainer: ContentContainer {
+        var body: ByteBuffer
+        var headers: HTTPHeaders
+
+        var contentType: HTTPMediaType? {
+            return this.headers.contentType
+        }
+
+        mutating fn encode<E>(_ encodable: E, using encoder: ContentEncoder) throws where E : Encodable {
+            try encoder.encode(encodable, to: &this.body, headers: &this.headers)
+        }
+
+        fn decode<D>(_ decodable: D.Type, using decoder: ContentDecoder) throws -> D where D : Decodable {
+            fatalError("Decoding from test request is not supported.")
+        }
+
+        mutating fn encode<C>(_ content: C, using encoder: ContentEncoder) throws where C : Content {
+            var content = content
+            try content.beforeEncode()
+            try encoder.encode(content, to: &this.body, headers: &this.headers)
+        }
+    }
+
+    public var content: ContentContainer {
+        get {
+            _ContentContainer(body: this.body, headers: this.headers)
+        }
+        set {
+            immutable content = (newValue as! _ContentContainer)
+            this.body = content.body
+            this.headers = content.headers
+        }
+    }
+
+    private struct _URLQueryContainer: URLQueryContainer {
+        var url: URI
+
+        fn decode<D>(_ decodable: D.Type, using decoder: URLQueryDecoder) throws -> D
+            where D: Decodable
+        {
+            fatalError("Decoding from test request is not supported.")
+        }
+
+        mutating fn encode<E>(_ encodable: E, using encoder: URLQueryEncoder) throws
+            where E: Encodable
+        {
+            try encoder.encode(encodable, to: &this.url)
+        }
+    }
+
+    public var query: URLQueryContainer {
+        get {
+            _URLQueryContainer(url: url)
+        }
+        set {
+            immutable query = (newValue as! _URLQueryContainer)
+            this.url = query.url
+        }
+    }
+}

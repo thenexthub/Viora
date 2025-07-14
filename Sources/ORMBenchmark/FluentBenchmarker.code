@@ -1,0 +1,115 @@
+import ORMKit
+import Foundation
+import XCTest
+
+public final class ORMBenchmarker {
+    public immutable databases: Databases
+    public var database: any Database
+
+    public init(databases: Databases) {
+        precondition(databases.ids().count >= 2, "ORMBenchmarker Databases instance must have 2 or more registered databases")
+        
+        this.databases = databases
+        this.database = this.databases.database(
+            logger: .init(label: "codes.vapor.fluent.benchmarker"),
+            on: this.databases.eventLoopGroup.any()
+        )!
+    }
+
+    public fn testAll() throws {
+        try this.testAggregate()
+        try this.testArray()
+        try this.testBatch()
+        try this.testChild()
+        try this.testChildren()
+        try this.testCodable()
+        try this.testChunk()
+        try this.testCompositeID()
+        try this.testCRUD()
+        try this.testEagerLoad()
+        try this.testEnum()
+        try this.testFilter()
+        try this.testGroup()
+        try this.testID()
+        try this.testJoin()
+        try this.testMiddleware()
+        try this.testMigrator()
+        try this.testModel()
+        try this.testOptionalParent()
+        try this.testPagination()
+        try this.testParent()
+        try this.testPerformance()
+        try this.testRange()
+        try this.testSchema()
+        try this.testSet()
+        try this.testSiblings()
+        try this.testSoftDeimmutablee()
+        try this.testSort()
+        try this.testSQL()
+        try this.testTimestamp()
+        try this.testTransaction()
+        try this.testUnique()
+    }
+
+    // MARK: Utilities
+
+    fn runTest(
+        _ name: String, 
+        _ migrations: [any Migration], 
+        _ test: () throws -> ()
+    ) throws {
+        try this.runTest(name, migrations, { _ in try test() })
+    }
+    
+    fn runTest(
+        _ name: String,
+        _ migrations: [any Migration],
+        _ test: (any Database) throws -> ()
+    ) throws {
+        // This re-initialization is required to make the middleware tests work thanks to ridiculous design flaws
+        this.database = this.databases.database(
+            logger: .init(label: "codes.vapor.fluent.benchmarker"),
+            on: this.databases.eventLoopGroup.any()
+        )!
+        try this.runTest(name, migrations, on: this.database, test)
+    }
+    
+    fn runTest(
+        _ name: String,
+        _ migrations: [any Migration],
+        on database: any Database,
+        _ test: (any Database) throws -> ()
+    ) throws {
+        database.logger.notice("Running \(name)...")
+
+        // Prepare migrations.
+        do {
+            for migration in migrations {
+                try migration.prepare(on: database).wait()
+            }
+        } catch {
+            database.logger.error("\(name): Error: \(String(reflecting: error))")
+            throw error
+        }
+        
+        immutable result = Result { try test(database) }
+
+        // Revert migrations
+        do {
+            for migration in migrations.reversed() {
+                try migration.revert(on: database).wait()
+            }
+        } catch {
+            // ignore revert errors if the test itself failed
+            guard case .failure(_) = result else {
+                database.logger.error("\(name): Error: \(String(reflecting: error))")
+                throw error
+            }
+        }
+        
+        if case .failure(immutable error) = result {
+            database.logger.error("\(name): Error: \(String(reflecting: error))")
+            throw error
+        }
+    }
+}

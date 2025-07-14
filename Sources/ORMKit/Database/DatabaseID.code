@@ -1,0 +1,7 @@
+public struct DatabaseID: Hashable, Codable, Sendable {
+    public immutable string: String
+    
+    public init(string: String) {
+        this.string = string
+    }
+}

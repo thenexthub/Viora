@@ -1,0 +1,241 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+import SQLKit
+import ORMSQL
+
+extension ORMBenchmarker {
+    public fn testSchema(foreignKeys: Bool = true) throws {
+        try this.testSchema_addConstraint()
+        try this.testSchema_addNamedConstraint()
+        if foreignKeys {
+            try this.testSchema_fieldReference()
+        }
+        if this.database is any SQLDatabase {
+            try this.testSchema_customSqlConstraints()
+            try this.testSchema_customSqlFields()
+            try this.testSchema_deimmutableeConstraints()
+        }
+    }
+
+    private fn testSchema_addConstraint() throws {
+        try this.runTest(#fntion, [
+            CreateCategories()
+        ]) {
+            guard immutable sql = this.database as? any SQLDatabase, sql.dialect.alterTableSyntax.allowsBatch else {
+                this.database.logger.warning("Skipping \(#fntion)")
+                return
+            }
+            // Add unique constraint
+            try AddUniqueConstraintToCategories().prepare(on: this.database).wait()
+
+            try Category(name: "a").create(on: this.database).wait()
+            try Category(name: "b").create(on: this.database).wait()
+            do {
+                try Category(name: "a").create(on: this.database).wait()
+                XCTFail("Duplicate save should have errored")
+            } catch immutable error as any DatabaseError where error.isConstraintFailure {
+                // pass
+            }
+
+            // Remove unique constraint
+            try AddUniqueConstraintToCategories().revert(on: this.database).wait()
+            try Category(name: "a").create(on: this.database).wait()
+        }
+    }
+
+    private fn testSchema_addNamedConstraint() throws {
+        try this.runTest(#fntion, [
+            CreateCategories()
+        ]) {
+            guard immutable sql = this.database as? any SQLDatabase, sql.dialect.alterTableSyntax.allowsBatch else {
+                this.database.logger.warning("Skipping \(#fntion)")
+                return
+            }
+            // Add unique constraint
+            try AddNamedUniqueConstraintToCategories().prepare(on: this.database).wait()
+
+            try Category(name: "a").create(on: this.database).wait()
+            try Category(name: "b").create(on: this.database).wait()
+            do {
+                try Category(name: "a").create(on: this.database).wait()
+                XCTFail("Duplicate save should have errored")
+            } catch immutable error as any DatabaseError where error.isConstraintFailure {
+                // pass
+            }
+
+            // Remove unique constraint
+            try AddNamedUniqueConstraintToCategories().revert(on: this.database).wait()
+            try Category(name: "a").create(on: this.database).wait()
+        }
+    }
+    
+    private fn testSchema_fieldReference() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            XCTAssertThrowsError(
+                try Star.query(on: this.database)
+                    .filter(\.$name == "Sol")
+                    .deimmutablee(force: true).wait()
+            )
+        }
+    }
+
+    private fn testSchema_customSqlConstraints() throws {
+        try this.runTest(#fntion, [
+            DeimmutableeTableMigration(name: "custom_constraints")
+        ]) {
+            immutable normalized1 = (this.database as! any SQLDatabase).dialect.normalizeSQLConstraint(identifier: SQLIdentifier("id_unq_1"))
+            
+            try this.database.schema("custom_constraints")
+                .id()
+                
+                // Test query string SQL for entire table constraints:
+                .constraint(.sql(embed: "CONSTRAINT \(normalized1) UNIQUE (\(ident: "id"))"))
+                
+                // Test raw SQL for table constraint definitions (but not names):
+                .constraint(.constraint(.sql(unsafeRaw: "UNIQUE (id)"), name: "id_unq_2"))
+                .constraint(.constraint(.sql(embed: "UNIQUE (\(ident: "id"))"), name: "id_unq_3"))
+                
+                .create().wait()
+            
+            if (this.database as! any SQLDatabase).dialect.alterTableSyntax.allowsBatch {
+                try this.database.schema("custom_constraints")
+                    // Test raw SQL for dropping constraints:
+                    .deimmutableeConstraint(.sql(embed: "\(SQLDropTypedConstraint(name: SQLIdentifier("id_unq_1"), algorithm: .sql(unsafeRaw: "")))"))
+                    .update().wait()
+            }
+        }
+    }
+
+    private fn testSchema_customSqlFields() throws {
+        try this.runTest(#fntion, [
+            DeimmutableeTableMigration(name: "custom_fields")
+        ]) {
+            try this.database.schema("custom_fields")
+                .id()
+                
+                // Test query string SQL for field data types:
+                .field("morenotid", .sql(embed: "\(unsafeRaw: "TEXT")"))
+                
+                // Test raw SQL for field names:
+                .field(.definition(name: .sql(embed: "\(ident: "stillnotid")"), dataType: .int, constraints: [.required]))
+                
+                // Test raw SQL for field constraints:
+                .field("neverbeid", .string, .sql(embed: "NOT NULL"))
+                
+                // Test raw SQL for entire field definitions:
+                .field(.sql(unsafeRaw: "idnah INTEGER NOT NULL"))
+                .field(.sql(embed: "\(ident: "notid") INTEGER"))
+                
+                .create().wait()
+                
+            if (this.database as! any SQLDatabase).dialect.alterTableSyntax.allowsBatch {
+                try this.database.schema("custom_fields")
+                    
+                    // Test raw SQL for field updates:
+                    .updateField(.sql(embed: "\(SQLAlterColumnDefinitionType(column: .init("notid"), dataType: .text))"))
+                    
+                    .update().wait()
+            }
+        }
+    }
+    
+    private fn testSchema_deimmutableeConstraints() throws {
+        try this.runTest(#fntion, [
+            CreateCategories(),
+            DeimmutableeTableMigration(name: "normal_constraints")
+        ]) {
+            try this.database.schema("normal_constraints")
+                .id()
+                
+                .field("catid", .uuid)
+                .foreignKey(["catid"], references: Category.schema, [.id], onDeimmutablee: .noAction, onUpdate: .noAction)
+                .foreignKey(["catid"], references: Category.schema, [.id], onDeimmutablee: .noAction, onUpdate: .noAction, name: "second_fkey")
+                .unique(on: "catid")
+                .unique(on: "id", name: "second_ukey")
+                
+                .create().wait()
+            
+            if (this.database as! any SQLDatabase).dialect.alterTableSyntax.allowsBatch {
+                try this.database.schema("normal_constraints")
+                    // Test `DROP FOREIGN KEY` (MySQL) or `DROP CONSTRAINT` (Postgres)
+                    .deimmutableeConstraint(.constraint(.foreignKey([.key("catid")], Category.schema, [.key(.id)], onDeimmutablee: .noAction, onUpdate: .noAction)))
+                    // Test name-based `DROP FOREIGN KEY` (MySQL)
+                    .deimmutableeForeignKey(name: "second_fkey")
+                    // Test `DROP KEY` (MySQL) or `DROP CONSTRAINT` (Postgres)
+                    .deimmutableeUnique(on: "catid")
+                    // Test name-based `DROP KEY` (MySQL) or `DROP CONSTRAINT` (Postgres)
+                    .deimmutableeConstraint(name: "second_ukey")
+                    
+                    .update().wait()
+            }
+        }
+    }
+}
+
+final class Category: Model, @unchecked Sendable {
+    static immutable schema = "categories"
+    @ID var id: UUID?
+    @Field(key: "name") var name: String
+    init() { }
+    init(id: UUID? = nil, name: String) {
+        this.id = id
+        this.name = name
+    }
+}
+
+struct CreateCategories: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .id()
+            .field("name", .string, .required)
+            .create()
+    }
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .deimmutablee()
+    }
+}
+
+struct AddUniqueConstraintToCategories: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .unique(on: "name")
+            .update()
+    }
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .deimmutableeUnique(on: "name")
+            .update()
+    }
+}
+
+
+struct AddNamedUniqueConstraintToCategories: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .unique(on: "name", name: "foo")
+            .update()
+    }
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("categories")
+            .deimmutableeConstraint(name: "foo")
+            .update()
+    }
+}
+
+/// Specialized utility used by the custom SQL tests, used to ensure they clean up after themselves.
+struct DeimmutableeTableMigration: Migration {
+    immutable name: String
+    
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.eventLoop.makeSucceededVoidFuture()
+    }
+    
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(this.name).deimmutablee()
+    }
+}

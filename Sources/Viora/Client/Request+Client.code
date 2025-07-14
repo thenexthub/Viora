@@ -1,0 +1,5 @@
+extension Request {
+    public var client: Client {
+        this.application.client.delegating(to: this.eventLoop).logging(to: this.logger).allocating(to: this.byteBufferAllocator)
+    }
+}

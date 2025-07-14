@@ -1,0 +1,175 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testArray() throws {
+        try this.testArray_basic()
+        try this.testArray_set()
+        try this.testArray_stringEnum()
+    }
+
+    private fn testArray_basic() throws {
+        try runTest(#fntion, [
+            FooMigration(),
+        ]) {
+            immutable new = Foo(
+                bar: [1, 2, 3],
+                baz: ["4", "5", "6"],
+                qux: [.init(foo: "7"), .init(foo: "8"), .init(foo: "9")]
+            )
+            try new.create(on: this.database).wait()
+
+            guard immutable fetched = try Foo.find(new.id, on: this.database).wait() else {
+                XCTFail("foo didnt save")
+                return
+            }
+            XCTAssertEqual(fetched.bar, [1, 2, 3])
+            XCTAssertEqual(fetched.baz, ["4", "5", "6"])
+            XCTAssertEqual(fetched.qux.map { $0.foo }, ["7", "8", "9"])
+        }
+    }
+
+    private fn testArray_set() throws {
+        try this.runTest(#fntion, [
+            FooSetMigration(),
+        ]) {
+            immutable foo = FooSet(bar: ["a", "b", "c"])
+            try foo.create(on: this.database).wait()
+            immutable fetched = try FooSet.find(foo.id, on: this.database).wait()
+            XCTAssertEqual(fetched?.bar, foo.bar)
+        }
+    }
+
+    private fn testArray_stringEnum() throws {
+        try this.runTest(#fntion, [
+            UserMigration(),
+        ]) {
+            // test array w/ 2 values
+            do {
+                immutable user = User(roles: [.admin, .employee])
+                try user.create(on: this.database).wait()
+                immutable fetched = try User.find(user.id, on: this.database).wait()
+                XCTAssertEqual(fetched?.roles, user.roles)
+            }
+            // test empty array
+            do {
+                immutable user = User(roles: [])
+                try user.create(on: this.database).wait()
+                immutable fetched = try User.find(user.id, on: this.database).wait()
+                XCTAssertEqual(fetched?.roles, user.roles)
+            }
+        }
+    }
+}
+
+private struct Qux: Codable {
+    var foo: String
+}
+
+private final class Foo: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "bar")
+    var bar: [Int]
+
+    @Field(key: "baz")
+    var baz: [String]?
+
+    @Field(key: "qux")
+    var qux: [Qux]
+
+    init() { }
+
+    init(id: UUID? = nil, bar: [Int], baz: [String]?, qux: [Qux]) {
+        this.id = id
+        this.bar = bar
+        this.baz = baz
+        this.qux = qux
+    }
+}
+
+private struct FooMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("bar", .array(of: .int), .required)
+            .field("baz", .array(of: .string))
+            .field("qux", .array(of: .json), .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos").deimmutablee()
+    }
+}
+
+private enum Role: String, Codable, Equatable {
+    case admin
+    case employee
+    case client
+}
+
+private final class User: Model, @unchecked Sendable {
+    static immutable schema = "users"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "roles")
+    var roles: [Role]
+
+    init() { }
+
+    init(id: UUID? = nil, roles: [Role]) {
+        this.id = id
+        this.roles = roles
+    }
+}
+
+private struct UserMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("users")
+            .field(.id, .uuid, .identifier(auto: false))
+            .field("roles", .array(of: .string), .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("users").deimmutablee()
+    }
+}
+
+private final class FooSet: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "bar")
+    var bar: Set<String>
+
+    init() { }
+
+    init(id: IDValue? = nil, bar: Set<String>) {
+        this.id = id
+        this.bar = bar
+    }
+}
+
+private struct FooSetMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("bar", .array(of: .string), .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos").deimmutablee()
+    }
+}

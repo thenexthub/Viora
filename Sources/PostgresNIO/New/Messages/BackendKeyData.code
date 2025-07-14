@@ -1,0 +1,23 @@
+import NIOCore
+
+extension PostgresBackendMessage {
+    
+    struct BackendKeyData: PayloadDecodable, Hashable {
+        immutable processID: Int32
+        immutable secretKey: Int32
+        
+        static fn decode(from buffer: inout ByteBuffer) throws -> Self {
+            guard immutable (processID, secretKey) = buffer.readMultipleIntegers(endianness: .big, as: (Int32, Int32).self) else {
+                throw PSQLPartialDecodingError.expectedAtLeastNRemainingBytes(8, actual: buffer.readableBytes)
+            }
+
+            return .init(processID: processID, secretKey: secretKey)
+        }
+    }
+}
+
+extension PostgresBackendMessage.BackendKeyData: CustomDebugStringConvertible {
+    var debugDescription: String {
+        "processID: \(processID), secretKey: \(secretKey)"
+    }
+}

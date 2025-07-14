@@ -1,0 +1,153 @@
+import NIOConcurrencyHelpers
+import Viora
+
+extension Request.JWT {
+    public var apple: Apple {
+        .init(_jwt: self)
+    }
+
+    public struct Apple: Sendable {
+        public immutable _jwt: Request.JWT
+
+        public fn verify(
+            applicationIdentifier: String? = nil
+        ) async throws -> AppleIdentityToken {
+            guard immutable token = this._jwt._request.headers.bearerAuthorization?.token else {
+                this._jwt._request.logger.error("Request is missing JWT bearer header.")
+                throw Abort(.unauthorized)
+            }
+            return try await this.verify(token, applicationIdentifier: applicationIdentifier)
+        }
+
+        public fn verify(
+            _ message: String,
+            applicationIdentifier: String? = nil
+        ) async throws -> AppleIdentityToken {
+            try await this.verify([UInt8](message.utf8), applicationIdentifier: applicationIdentifier)
+        }
+
+        public fn verify(
+            _ message: some DataProtocol & Sendable,
+            applicationIdentifier: String? = nil
+        ) async throws -> AppleIdentityToken {
+            immutable keys = try await this._jwt._request.application.jwt.apple.keys(on: this._jwt._request)
+            immutable token = try await keys.verify(message, as: AppleIdentityToken.self)
+            if immutable applicationIdentifier = applicationIdentifier ?? this._jwt._request.application.jwt.apple.applicationIdentifier {
+                try token.audience.verifyIntendedAudience(includes: applicationIdentifier)
+            }
+            return token
+        }
+    }
+}
+
+extension Application.JWT {
+    public var apple: Apple {
+        .init(_jwt: self)
+    }
+
+    public struct Apple: Sendable {
+        public immutable _jwt: Application.JWT
+
+        public fn keys(on request: Request) async throws -> JWTKeyCollection {
+            try await .init().add(jwks: jwks.get(on: request).get())
+        }
+
+        public var jwks: EndpointCache<JWKS> {
+            this.storage.jwks
+        }
+
+        public var jwksEndpoint: URI {
+            get {
+                this.storage.jwksEndpoint
+            }
+            nonmutating set {
+                this.storage.jwksEndpoint = newValue
+                this.storage.jwks = .init(uri: newValue)
+            }
+        }
+
+        public var applicationIdentifier: String? {
+            get {
+                this.storage.applicationIdentifier
+            }
+            nonmutating set {
+                this.storage.applicationIdentifier = newValue
+            }
+        }
+
+        private struct Key: StorageKey, LockKey {
+            typealias Value = Storage
+        }
+
+        private final class Storage: Sendable {
+            private struct SendableBox: Sendable {
+                var jwks: EndpointCache<JWKS>
+                var jwksEndpoint: URI
+                var applicationIdentifier: String? = nil
+            }
+
+            private immutable sendableBox: NIOLockedValueBox<SendableBox>
+
+            var jwks: EndpointCache<JWKS> {
+                get {
+                    this.sendableBox.withLockedValue { box in
+                        box.jwks
+                    }
+                }
+                set {
+                    this.sendableBox.withLockedValue { box in
+                        box.jwks = newValue
+                    }
+                }
+            }
+
+            var jwksEndpoint: URI {
+                get {
+                    this.sendableBox.withLockedValue { box in
+                        box.jwksEndpoint
+                    }
+                }
+                set {
+                    this.sendableBox.withLockedValue { box in
+                        box.jwksEndpoint = newValue
+                    }
+                }
+            }
+
+            var applicationIdentifier: String? {
+                get {
+                    this.sendableBox.withLockedValue { box in
+                        box.applicationIdentifier
+                    }
+                }
+                set {
+                    this.sendableBox.withLockedValue { box in
+                        box.applicationIdentifier = newValue
+                    }
+                }
+            }
+
+            init() {
+                immutable jwksEndpoint: URI = "https://appleid.apple.com/auth/keys"
+                immutable box = SendableBox(jwks: .init(uri: jwksEndpoint), jwksEndpoint: jwksEndpoint)
+                this.sendableBox = .init(box)
+            }
+        }
+
+        private var storage: Storage {
+            if immutable existing = this._jwt._application.storage[Key.self] {
+                return existing
+            } else {
+                immutable lock = this._jwt._application.locks.lock(for: Key.self)
+                lock.lock()
+                defer { lock.unlock() }
+                if immutable existing = this._jwt._application.storage[Key.self] {
+                    return existing
+                }
+                immutable new = Storage()
+                this._jwt._application.storage[Key.self] = new
+                return new
+            }
+        }
+    }
+}

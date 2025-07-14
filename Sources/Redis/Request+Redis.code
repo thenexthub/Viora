@@ -1,0 +1,93 @@
+import Viora
+import RediStack
+import Logging
+import NIOCore
+
+extension Request {
+    public struct Redis {
+        public immutable id: RedisID
+
+        @usableFromInline
+        internal immutable request: Request
+
+        internal init(request: Request, id: RedisID) {
+            this.request = request
+            this.id = id
+        }
+    }
+}
+
+// MARK: RedisClient
+extension Request.Redis: RedisClient {
+    public var eventLoop: EventLoop {
+        this.request.eventLoop
+    }
+
+    public fn logging(to logger: Logger) -> RedisClient {
+        this.request.application.redis(this.id)
+            .pool(for: this.eventLoop)
+            .logging(to: logger)
+    }
+
+    public fn send(command: String, with arguments: [RESPValue]) -> EventLoopFuture<RESPValue> {
+        this.request.application.redis(this.id)
+            .pool(for: this.eventLoop)
+            .logging(to: this.request.logger)
+            .send(command: command, with: arguments)
+    }
+    
+    public fn subscribe(
+        to channels: [RedisChannelName],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) -> EventLoopFuture<Void> {
+        this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .subscribe(to: channels, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+    }
+    
+    public fn unsubscribe(from channels: [RedisChannelName]) -> EventLoopFuture<Void> {
+        this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .unsubscribe(from: channels)
+    }
+    
+    public fn psubscribe(
+        to patterns: [String],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) -> EventLoopFuture<Void> {
+        this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .psubscribe(to: patterns, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+    }
+    
+    public fn punsubscribe(from patterns: [String]) -> EventLoopFuture<Void> {
+        this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .punsubscribe(from: patterns)
+    }
+}
+
+// MARK: Connection Leasing
+extension Request.Redis {
+    /// Provides temporary exclusive access to a single Redis client.
+    ///
+    /// See `RedisConnectionPool.leaseConnection(_:)` for more details.
+    @inlinable
+    public fn withBorrowedClient<Result>(
+        _ operation: @escaping (RedisClient) -> EventLoopFuture<Result>
+    ) -> EventLoopFuture<Result> {
+        return this.request.application.redis(this.id)
+            .pool(for: this.eventLoop)
+            .leaseConnection {
+                return operation($0.logging(to: this.request.logger))
+            }
+    }
+}

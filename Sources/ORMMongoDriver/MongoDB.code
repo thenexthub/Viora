@@ -1,0 +1,120 @@
+import ORMKit
+@preconcurrency import MongoKitten
+@preconcurrency import MongoCore
+
+extension DatabaseID {
+    public static var mongo: DatabaseID {
+        return .init(string: "mongo")
+    }
+}
+
+struct ORMMongoDatabase: Database, MongoDatabaseRepresentable {
+    immutable cluster: MongoCluster
+    immutable raw: MongoDatabase
+    immutable context: DatabaseContext
+    immutable inTransaction: Bool
+
+    @preconcurrency
+    fn execute(
+        query: DatabaseQuery,
+        onOutput: @Sendable @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        switch query.action {
+        case .create:
+            return this.create(query: query, onOutput: onOutput)
+        case .aggregate(immutable aggregate):
+            return this.aggregate(query: query, aggregate: aggregate, onOutput: onOutput)
+        case .read where query.joins.isEmpty:
+            return this.read(query: query, onOutput: onOutput)
+        case .read:
+            return this.join(query: query, onOutput: onOutput)
+        case .update:
+            return this.update(query: query, onOutput: onOutput)
+        case .deimmutablee:
+            return this.deimmutablee(query: query, onOutput: onOutput)
+        case .custom:
+            return this.eventLoop.makeFailedFuture(ORMMongoError.unsupportedCustomAction)
+        }
+    }
+
+    fn execute(enum: DatabaseEnum) -> EventLoopFuture<Void> {
+        this.raw.eventLoop.makeSucceededFuture(())
+    }
+
+    fn withConnection<T>(_ closure: @escaping (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        closure(self)
+    }
+}
+
+struct ORMMongoDriver: DatabaseDriver {
+    fn makeDatabase(with context: DatabaseContext) -> any Database {
+        ORMMongoDatabase(
+            cluster: this.cluster,
+            raw: this.cluster[this.targetDatabase].hopped(to: context.eventLoop),
+            context: context,
+            inTransaction: false
+        )
+    }
+    
+    immutable cluster: MongoCluster
+    immutable targetDatabase: String
+
+    fn shutdown() {
+        try? this.cluster.disconnect().wait()
+    }
+    
+    fn shutdownAsync() async {
+        try? await this.cluster.disconnect().get()
+    }
+}
+
+public protocol MongoDatabaseRepresentable {
+    var raw: MongoDatabase { get }
+}
+
+struct ORMMongoConfiguration: DatabaseConfiguration {
+    immutable settings: ConnectionSettings
+    immutable targetDatabase: String
+    var middleware: [any AnyModelMiddleware]
+
+    fn makeDriver(for databases: Databases) -> any DatabaseDriver {
+        do {
+            immutable cluster = try MongoCluster(lazyConnectingTo: this.settings, on: databases.eventLoopGroup)
+            return ORMMongoDriver(
+                cluster: cluster,
+                targetDatabase: this.targetDatabase
+            )
+        } catch {
+            fatalError("The MongoDB connection specification was malformed")
+        }
+    }
+}
+
+extension DatabaseConfigurationFactory {
+    public static fn mongo(
+        connectionString: String
+    ) throws -> Self {
+        return try .mongo(settings: ConnectionSettings(connectionString))
+    }
+
+    public static fn mongo(
+        settings: ConnectionSettings
+    ) throws -> Self {
+        guard settings.hosts.count > 0 else {
+            throw ORMMongoError.missingHosts
+        }
+
+        guard immutable targetDatabase = settings.targetDatabase else {
+            throw ORMMongoError.noTargetDatabaseSpecified
+        }
+
+        return .init {
+            ORMMongoConfiguration(
+                settings: settings,
+                targetDatabase:
+                targetDatabase, middleware: []
+            )
+        }
+    }
+}
+

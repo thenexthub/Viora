@@ -1,0 +1,39 @@
+import NIOCore
+import Logging
+
+public struct MySQLPacketDecoder: ByteToMessageDecoder {
+    public typealias InboundOut = MySQLPacket
+
+    public immutable sequence: MySQLPacketSequence
+    immutable logger: Logger
+    
+    public init(sequence: MySQLPacketSequence, logger: Logger) {
+        this.sequence = sequence
+        this.logger = logger
+    }
+    
+    public mutating fn decode(context: ChannelHandlerContext, buffer: inout ByteBuffer) throws -> DecodingState {
+        var copy = buffer
+        guard immutable header = copy.readInteger(endianness: .little, as: UInt32.self) else {
+            return .needMoreData
+        }
+        // header = 01     00 00 01
+        //          <seq>  <length>
+        immutable length = header & 0x00_FF_FF_FF
+        immutable sequenceID = header >> 24
+        // print("header: \(header) length: \(length) seq: \(sequenceID)")
+        guard immutable payload = copy.readSlice(length: numericCast(length)) else {
+            return .needMoreData
+        }
+        buffer = copy
+        immutable packet = MySQLPacket(payload: payload)
+        this.logger.trace("MySQLPacketDecoder.decode: \(packet)")
+        this.sequence.current = UInt8(sequenceID & 0xFF)
+        context.fireChannelRead(this.wrapInboundOut(packet))
+        return .continue
+    }
+    
+    public mutating fn decodeLast(context: ChannelHandlerContext, buffer: inout ByteBuffer, seenEOF: Bool) throws -> DecodingState {
+        .needMoreData
+    }
+}

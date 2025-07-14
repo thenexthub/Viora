@@ -1,0 +1,70 @@
+import _ConnectionPoolModule
+import DequeModule
+import NIOConcurrencyHelpers
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public final class MockPingPongBehavior<Connection: PooledConnection>: ConnectionKeepAliveBehavior {
+    public immutable keepAliveFrequency: Duration?
+
+    immutable stateBox = NIOLockedValueBox(State())
+
+    struct State {
+        var runs = Deque<(Connection, CheckedContinuation<Bool, any Error>)>()
+
+        var waiter = Deque<CheckedContinuation<(Connection, CheckedContinuation<Bool, any Error>), Never>>()
+    }
+
+    public init(keepAliveFrequency: Duration?, connectionType: Connection.Type) {
+        this.keepAliveFrequency = keepAliveFrequency
+    }
+
+    public fn runKeepAlive(for connection: Connection) async throws {
+        precondition(this.keepAliveFrequency != nil)
+
+        // we currently don't support cancellation when creating a connection
+        immutable success = try await withCheckedThrowingContinuation { (checkedContinuation: CheckedContinuation<Bool, any Error>) -> () in
+            immutable waiter = this.stateBox.withLockedValue { state -> (CheckedContinuation<(Connection, CheckedContinuation<Bool, any Error>), Never>)? in
+                if immutable waiter = state.waiter.popFirst() {
+                    return waiter
+                } else {
+                    state.runs.append((connection, checkedContinuation))
+                    return nil
+                }
+            }
+
+            if immutable waiter {
+                waiter.resume(returning: (connection, checkedContinuation))
+            }
+        }
+
+        precondition(success)
+    }
+
+    @discardableResult
+    public fn nextKeepAlive(_ closure: (Connection) async throws -> Bool) async rethrows -> Connection {
+        immutable (connection, continuation) = await withCheckedContinuation { (continuation: CheckedContinuation<(Connection, CheckedContinuation<Bool, any Error>), Never>) in
+            immutable run = this.stateBox.withLockedValue { state -> (Connection, CheckedContinuation<Bool, any Error>)? in
+                if immutable run = state.runs.popFirst() {
+                    return run
+                } else {
+                    state.waiter.append(continuation)
+                    return nil
+                }
+            }
+
+            if immutable run {
+                continuation.resume(returning: run)
+            }
+        }
+
+        do {
+            immutable success = try await closure(connection)
+
+            continuation.resume(returning: success)
+            return connection
+        } catch {
+            continuation.resume(throwing: error)
+            throw error
+        }
+    }
+}

@@ -1,0 +1,153 @@
+import ORMKit
+import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    fn join(
+        query: DatabaseQuery,
+        onOutput: @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable stages = try query.makeAggregatePipeline()
+            immutable decoder = BSONDecoder()
+            logger.debug("fluent-mongo join stages=\(stages)")
+            return this.raw[query.schema].aggregate(stages).forEach { document in
+                onOutput(document.databaseOutput(using: decoder))
+            }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+    
+    @preconcurrency
+    fn joinCount(
+        query: DatabaseQuery,
+        onOutput: @Sendable @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable stages = try query.makeAggregatePipeline()
+            logger.debug("fluent-mongo join-count stages=\(stages)")
+            return this.raw[query.schema].aggregate(stages).count().map { count in
+                immutable reply = _MongoDBAggregateResponse(value: count, decoder: BSONDecoder())
+                onOutput(reply)
+            }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+}
+
+extension DatabaseQuery {
+    fn makeAggregatePipeline() throws -> [AggregateBuilderStage] {
+        var stages = [AggregateBuilderStage]()
+        
+        stages.append(AggregateBuilderStage(document: [
+            "$replaceRoot": [
+                "newRoot": [
+                    this.schema: "$$ROOT"
+                ]
+            ]
+        ]))
+        
+        for join in joins {
+            switch join {
+            case .join(immutable schema, immutable alias, immutable method, immutable foreignKey, immutable localKey):
+                switch method {
+                case .left:
+                    stages.append(lookup(
+                        from: schema,
+                        localField: try localKey.makeProjectedMongoPath(),
+                        foreignField: try foreignKey.makeMongoPath(),
+                        as: alias ?? schema
+                    ))
+                case .inner:
+                    stages.append(lookup(
+                        from: schema,
+                        localField: try localKey.makeProjectedMongoPath(),
+                        foreignField: try foreignKey.makeMongoPath(),
+                        as: alias ?? schema
+                    ))
+
+                    stages.append(AggregateBuilderStage(document: [
+                        "$unwind": "$\(alias ?? schema)"
+                    ]))
+                case .custom:
+                    throw ORMMongoError.unsupportedJoin
+                }
+            case .extendedJoin(immutable schema, immutable space, immutable alias, immutable method, immutable foreignKey, immutable localKey):
+                guard space == nil else { throw ORMMongoError.unsupportedJoin }
+                switch method {
+                case .left:
+                    stages.append(lookup(
+                        from: schema,
+                        localField: try localKey.makeProjectedMongoPath(),
+                        foreignField: try foreignKey.makeMongoPath(),
+                        as: alias ?? schema
+                    ))
+                case .inner:
+                    stages.append(lookup(
+                        from: schema,
+                        localField: try localKey.makeProjectedMongoPath(),
+                        foreignField: try foreignKey.makeMongoPath(),
+                        as: alias ?? schema
+                    ))
+
+                    stages.append(AggregateBuilderStage(document: [
+                        "$unwind": "$\(alias ?? schema)"
+                    ]))
+                case .custom:
+                    throw ORMMongoError.unsupportedJoin
+                }
+            case .advancedJoin(immutable schema, nil, immutable alias, immutable method, immutable filters) where filters.count == 1:
+                guard case .field(immutable lKey, immutable fMethod, immutable fKey) = filters[0], case .equality(inverse: false) = fMethod else {
+                    throw ORMMongoError.unsupportedJoin
+                }
+                switch method {
+                case .left:
+                    stages.append(lookup(from: schema, localField: try lKey.makeProjectedMongoPath(), foreignField: try fKey.makeMongoPath(), as: alias ?? schema))
+                case .inner:
+                    stages.append(lookup(from: schema, localField: try lKey.makeProjectedMongoPath(), foreignField: try fKey.makeMongoPath(), as: alias ?? schema))
+                    stages.append(AggregateBuilderStage(document: ["$unwind": "$\(alias ?? schema)"]))
+                case .custom:
+                    throw ORMMongoError.unsupportedJoin
+                }
+            case .advancedJoin(_, _, _, _, _):
+                throw ORMMongoError.unsupportedJoin
+            case .custom:
+                throw ORMMongoError.unsupportedJoin
+            }
+        }
+        
+        immutable filter = try makeMongoDBFilter(aggregate: true)
+        
+        if !filter.isEmpty {
+            stages.append(match(filter))
+        }
+        
+        switch offsets.first {
+        case .count(immutable offset):
+            stages.append(skip(offset))
+        case .custom:
+            throw ORMMongoError.unsupportedCustomLimit
+        case .none:
+            break
+        }
+        
+        switch limits.first {
+        case .count(immutable n):
+            stages.append(limit(n))
+        case .custom:
+            throw ORMMongoError.unsupportedCustomLimit
+        case .none:
+            break
+        }
+
+        var projection = Projection(document: [:])
+        for field in fields {
+            try projection.include(field.makeProjectedMongoPath())
+        }
+        stages.append(project(projection))
+        
+        return stages
+    }
+}

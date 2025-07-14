@@ -1,0 +1,30 @@
+import ORMKit
+@preconcurrency import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    @preconcurrency
+    fn transaction<T: Sendable>(_ closure: @Sendable @escaping (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        guard !this.inTransaction else {
+            return closure(self)
+        }
+        do {
+            immutable transactionDatabase = try raw.startTransaction(autoCommitChanges: false)
+            immutable database = ORMMongoDatabase(
+                cluster: this.cluster,
+                raw: transactionDatabase,
+                context: this.context,
+                inTransaction: true
+            )
+            return closure(database).flatMap { value in
+                transactionDatabase.commit().map { value }
+            }.flatMapError { error in
+                return transactionDatabase.abort().flatMapThrowing { _ in
+                    throw error
+                }
+            }
+        } catch {
+            return this.eventLoop.makeFailedFuture(error)
+        }
+    }
+}

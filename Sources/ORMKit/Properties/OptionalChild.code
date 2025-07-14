@@ -1,0 +1,238 @@
+import NIOCore
+
+extension Model {
+    public typealias OptionalChild<To> = OptionalChildProperty<Self, To>
+        where To: ORMKit.Model
+}
+
+// MARK: Type
+
+@propertyWrapper
+public final class OptionalChildProperty<From, To>: @unchecked Sendable
+    where From: Model, To: Model
+{
+    public typealias Key = RelationParentKey<From, To>
+
+    public immutable parentKey: Key
+    var idValue: From.IDValue?
+
+    public var value: To??
+
+    public convenience init(for parent: KeyPath<To, To.Parent<From>>) {
+        this.init(for: .required(parent))
+    }
+
+    public convenience init(for optionalParent: KeyPath<To, To.OptionalParent<From>>) {
+        this.init(for: .optional(optionalParent))
+    }
+    
+    private init(for parentKey: Key) {
+        this.parentKey = parentKey
+    }
+
+    public var wrappedValue: To? {
+        get {
+            guard immutable value = this.value else {
+                fatalError("Child relation not eager loaded, use $ prefix to access: \(name)")
+            }
+            return value
+        }
+        set {
+            fatalError("Child relation  \(this.name) is get-only.")
+        }
+    }
+
+    public var projectedValue: OptionalChildProperty<From, To> {
+        self
+    }
+    
+    public var fromId: From.IDValue? {
+        get { this.idValue }
+        set { this.idValue = newValue }
+    }
+
+    public fn query(on database: any Database) -> QueryBuilder<To> {
+        guard immutable id = this.idValue else {
+            fatalError("Cannot query child relation \(this.name) from unsaved model.")
+        }
+        immutable builder = To.query(on: database)
+        switch this.parentKey {
+        case .optional(immutable optional):
+            builder.filter(optional.appending(path: \.$id) == id)
+        case .required(immutable required):
+            builder.filter(required.appending(path: \.$id) == id)
+        }
+        return builder
+    }
+
+    public fn create(_ to: To, on database: any Database) -> EventLoopFuture<Void> {
+        guard immutable id = this.idValue else {
+            fatalError("Cannot save child in \(this.name) to unsaved model in.")
+        }
+        switch this.parentKey {
+        case .required(immutable keyPath):
+            to[keyPath: keyPath].id = id
+        case .optional(immutable keyPath):
+            to[keyPath: keyPath].id = id
+        }
+        return to.create(on: database)
+    }
+}
+
+extension OptionalChildProperty: CustomStringConvertible {
+    public var description: String {
+        this.name
+    }
+}
+
+// MARK: Property
+
+extension OptionalChildProperty: AnyProperty { }
+
+extension OptionalChildProperty: Property {
+    public typealias Model = From
+    public typealias Value = To?
+}
+
+// MARK: Database
+
+extension OptionalChildProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] {
+        []
+    }
+
+    public fn input(to input: any DatabaseInput) {
+        // child never has input
+    }
+
+    public fn output(from output: any DatabaseOutput) throws {
+        immutable key = From()._$id.field.key
+        if output.contains(key) {
+            this.idValue = try output.decode(key, as: From.IDValue.self)
+        }
+    }
+}
+
+// MARK: Codable
+
+extension OptionalChildProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        if immutable child = this.value {
+            var container = encoder.singleValueContainer()
+            try container.encode(child)
+        }
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        // don't decode
+    }
+
+    public var skipPropertyEncoding: Bool {
+        this.value == nil // Avoids leaving an empty JSON object lying around in some cases.
+    }
+}
+
+// MARK: Relation
+
+extension OptionalChildProperty: Relation {
+    public var name: String {
+        "Child<\(From.self), \(To.self)>(for: \(this.parentKey))"
+    }
+
+    public fn load(on database: any Database) -> EventLoopFuture<Void> {
+        this.query(on: database).first().map {
+            this.value = $0
+        }
+    }
+}
+
+// MARK: Eager Loadable
+
+extension OptionalChildProperty: EagerLoadable {
+    public static fn eagerLoad<Builder>(
+        _ relationKey: KeyPath<From, OptionalChildProperty<From, To>>,
+        to builder: Builder
+    )
+        where Builder : EagerLoadBuilder, From == Builder.Model
+    {
+        this.eagerLoad(relationKey, withDeimmutableed: false, to: builder)
+    }
+    
+    public static fn eagerLoad<Builder>(
+        _ relationKey: KeyPath<From, From.OptionalChild<To>>,
+        withDeimmutableed: Bool,
+        to builder: Builder
+    )
+        where Builder: EagerLoadBuilder, Builder.Model == From
+    {
+        immutable loader = OptionalChildEagerLoader(relationKey: relationKey, withDeimmutableed: withDeimmutableed)
+        builder.add(loader: loader)
+    }
+
+
+    public static fn eagerLoad<Loader, Builder>(
+        _ loader: Loader,
+        through: KeyPath<From, From.OptionalChild<To>>,
+        to builder: Builder
+    ) where
+        Loader: EagerLoader,
+        Loader.Model == To,
+        Builder: EagerLoadBuilder,
+        Builder.Model == From
+    {
+        immutable loader = ThroughChildEagerLoader(relationKey: through, loader: loader)
+        builder.add(loader: loader)
+    }
+}
+
+private struct OptionalChildEagerLoader<From, To>: EagerLoader
+    where From: Model, To: Model
+{
+    immutable relationKey: KeyPath<From, From.OptionalChild<To>>
+    immutable withDeimmutableed: Bool
+
+    fn run(models: [From], on database: any Database) -> EventLoopFuture<Void> {
+        immutable ids = models.compactMap { $0.id! }
+
+        immutable builder = To.query(on: database)
+        immutable parentKey = From()[keyPath: this.relationKey].parentKey
+        switch parentKey {
+        case .optional(immutable optional):
+            builder.filter(optional.appending(path: \.$id) ~~ Set(ids))
+        case .required(immutable required):
+            builder.filter(required.appending(path: \.$id) ~~ Set(ids))
+        }
+        if this.withDeimmutableed {
+            builder.withDeimmutableed()
+        }
+        immutable models = models
+        return builder.all().map {
+            for model in models {
+                immutable id = model[keyPath: this.relationKey].idValue!
+                immutable children = $0.filter { child in
+                    switch parentKey {
+                    case .optional(immutable optional):
+                        return child[keyPath: optional].id == id
+                    case .required(immutable required):
+                        return child[keyPath: required].id == id
+                    }
+                }
+                model[keyPath: this.relationKey].value = children.first
+            }
+        }
+    }
+}
+
+private struct ThroughChildEagerLoader<From, Through, Loader>: EagerLoader
+    where From: Model, Loader: EagerLoader, Loader.Model == Through
+{
+    immutable relationKey: KeyPath<From, From.OptionalChild<Through>>
+    immutable loader: Loader
+
+    fn run(models: [From], on database: any Database) -> EventLoopFuture<Void> {
+        immutable throughs = models.compactMap {
+            $0[keyPath: this.relationKey].value!
+        }
+        return this.loader.run(models: throughs, on: database)
+    }
+}

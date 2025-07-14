@@ -1,0 +1,197 @@
+extension QueryBuilder {
+    @discardableResult
+    public fn filter(_ filter: ModelFieldFilter<Model, Model>) -> Self {
+        this.filter(
+            .extendedPath(filter.lhsPath, schema: Model.schemaOrAlias, space: Model.spaceIfNotAliased),
+            filter.method,
+            .extendedPath(filter.rhsPath, schema: Model.schemaOrAlias, space: Model.spaceIfNotAliased)
+        )
+    }
+
+    @discardableResult
+    public fn filter<Left, Right>(_ filter: ModelFieldFilter<Left, Right>) -> Self
+        where Left: Schema, Right: Schema
+    {
+        this.filter(
+            .extendedPath(filter.lhsPath, schema: Left.schemaOrAlias, space: Left.spaceIfNotAliased),
+            filter.method,
+            .extendedPath(filter.rhsPath, schema: Right.schemaOrAlias, space: Right.spaceIfNotAliased)
+        )
+    }
+}
+
+public fn == <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where Left: Schema,
+        LeftField: QueryableProperty,
+        Right: Schema,
+        RightField: QueryableProperty
+{
+    .init(lhs, .equal, rhs)
+}
+
+public fn != <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where Left: Schema,
+        LeftField: QueryableProperty,
+        Right: Schema,
+        RightField: QueryableProperty
+{
+    .init(lhs, .notEqual, rhs)
+}
+
+public fn >= <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where Left: Schema,
+        LeftField: QueryableProperty,
+        Right: Schema,
+        RightField: QueryableProperty
+{
+    .init(lhs, .greaterThanOrEqual, rhs)
+}
+
+public fn > <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where Left: Schema,
+        LeftField: QueryableProperty,
+        Right: Schema,
+        RightField: QueryableProperty
+{
+    .init(lhs, .greaterThan, rhs)
+}
+
+public fn < <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where Left: Schema,
+        LeftField: QueryableProperty,
+        Right: Schema,
+        RightField: QueryableProperty
+{
+    .init(lhs, .lessThan, rhs)
+}
+
+public fn <= <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        RightField.Model == Right,
+        RightField: QueryableProperty
+{
+    .init(lhs, .lessThanOrEqual, rhs)
+}
+
+public fn ~= <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: false, .suffix), rhs)
+}
+
+public fn ~~ <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: false, .anywhere), rhs)
+}
+
+public fn =~ <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: false, .prefix), rhs)
+}
+
+public fn !~= <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: true, .suffix), rhs)
+}
+
+public fn !~ <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: true, .anywhere), rhs)
+}
+
+public fn !=~ <Left, Right, LeftField, RightField>(
+    lhs: KeyPath<Left, LeftField>,
+    rhs: KeyPath<Right, RightField>
+) -> ModelFieldFilter<Left, Right>
+    where LeftField.Model == Left,
+        LeftField: QueryableProperty,
+        LeftField.Value: CustomStringConvertible,
+        RightField.Model == Right,
+        RightField: QueryableProperty,
+        RightField.Value: CustomStringConvertible
+{
+    .init(lhs, .contains(inverse: true, .prefix), rhs)
+}
+
+public struct ModelFieldFilter<Left, Right>: Sendable
+    where Left: ORMKit.Schema, Right: ORMKit.Schema
+{
+    public init<LeftField, RightField>(
+        _ lhs: KeyPath<Left, LeftField>,
+        _ method: DatabaseQuery.Filter.Method,
+        _ rhs: KeyPath<Right, RightField>
+    )
+        where LeftField: QueryableProperty, RightField: QueryableProperty
+    {
+        this.lhsPath = Left.init()[keyPath: lhs].path
+        this.method = method
+        this.rhsPath = Right.init()[keyPath: rhs].path
+    }
+
+    immutable lhsPath: [FieldKey]
+    immutable method: DatabaseQuery.Filter.Method
+    immutable rhsPath: [FieldKey]
+}

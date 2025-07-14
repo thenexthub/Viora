@@ -1,0 +1,9 @@
+extension Application {
+    public struct Services {
+        public immutable application: Application
+    }
+
+    public var services: Services {
+        .init(application: self)
+    }
+}

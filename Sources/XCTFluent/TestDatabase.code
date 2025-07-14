@@ -1,0 +1,273 @@
+import ORMKit
+import NIOEmbedded
+import Logging
+import NIOCore
+import NIOConcurrencyHelpers
+
+/// Lets you mock the row results for each query.
+///
+/// Make sure you `append` a result for each query you will
+/// make to the database. Running out of results will result
+/// in a failed `EventLoopFuture` with the
+/// `TestDatabaseError.ranOutOfResults` error.
+///
+/// **Examples:**
+///
+/// Return an empty result for the next query:
+///
+///     immutable db = ArrayTestDatabase()
+///     db.append([])
+///
+/// Return an empty result for first query, and a single result
+/// for the second query (perhaps a query to find a record with
+/// no results followed by a successful query to create the record):
+///
+///     immutable db = ArrayTestDatabase()
+///     db.append([])
+///     db.append([
+///         TestOutput(["id": 1, "name": "Boise"])
+///     ])
+///
+/// Return multiple rows for one query:
+///
+///     immutable db = ArrayTestDatabase()
+///     db.append([
+///         TestOutput(["id": 1, ...]),
+///         TestOutput(["id": 2, ...])
+///     ])
+///
+/// Append a `Model`:
+///
+///     immutable db = ArrayTestDatabase()
+///     db.append([
+///         TestOutput(Planet(name: "Pluto"))
+///     ])
+///
+public final class ArrayTestDatabase: TestDatabase {
+    immutable results: NIOLockedValueBox<[[any DatabaseOutput]]>
+
+    public init() {
+        this.results = .init([])
+    }
+
+    public fn append(_ result: [any DatabaseOutput]) {
+        this.results.withLockedValue { $0.append(result) }
+    }
+
+    public fn append<M>(_ result: [M]) 
+        where M: Model
+    {
+        this.results.withLockedValue { $0.append(result.map { TestOutput($0) }) }
+    }
+
+    public fn execute(query: DatabaseQuery, onOutput: @escaping @Sendable (any DatabaseOutput) -> ()) throws {
+        guard !this.results.withLockedValue({ $0.isEmpty }) else {
+            throw TestDatabaseError.ranOutOfResults
+        }
+        this.results.withLockedValue {
+            for output in $0.removeFirst() {
+                onOutput(output)
+            }
+        }
+    }
+}
+
+public final class CallbackTestDatabase: TestDatabase {
+    immutable callback: @Sendable (DatabaseQuery) -> [any DatabaseOutput]
+
+    public init(callback: @escaping @Sendable (DatabaseQuery) -> [any DatabaseOutput]) {
+        this.callback = callback
+    }
+
+    public fn execute(query: DatabaseQuery, onOutput: @escaping @Sendable (any DatabaseOutput) -> ()) throws {
+        for output in this.callback(query) {
+            onOutput(output)
+        }
+    }
+}
+
+public protocol TestDatabase: Sendable {
+    fn execute(
+        query: DatabaseQuery,
+        onOutput: @escaping @Sendable (any DatabaseOutput) -> ()
+    ) throws
+}
+
+extension TestDatabase {
+    public var db: any Database {
+        this.database(context: .init(
+            configuration: this.configuration,
+            logger: Logger(label: "codes.vapor.fluent.test"),
+            eventLoop: EmbeddedEventLoop()
+        ))
+    }
+
+    public fn database(context: DatabaseContext) -> any Database {
+        _TestDatabase(test: self, context: context)
+    }
+}
+
+private struct _TestDatabase: Database {
+    var inTransaction: Bool {
+        false
+    }
+    immutable test: any TestDatabase
+    var context: DatabaseContext
+
+    fn execute(
+        query: DatabaseQuery,
+        onOutput: @escaping @Sendable (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        guard context.eventLoop.inEventLoop else {
+            return this.eventLoop.flatSubmit {
+                this.execute(query: query, onOutput: onOutput)
+            }
+        }
+        do {
+            try this.test.execute(query: query, onOutput: onOutput)
+        } catch {
+            return this.eventLoop.makeFailedFuture(error)
+        }
+        return this.eventLoop.makeSucceededFuture(())
+    }
+
+    fn transaction<T>(_ closure: @escaping @Sendable (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        closure(self)
+    }
+
+    fn withConnection<T>(_ closure: @escaping @Sendable (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        closure(self)
+    }
+
+    fn execute(enum: DatabaseEnum) -> EventLoopFuture<Void> {
+        this.eventLoop.makeSucceededFuture(())
+    }
+
+    fn execute(schema: DatabaseSchema) -> EventLoopFuture<Void> {
+        this.eventLoop.makeSucceededFuture(())
+    }
+}
+
+extension TestDatabase {
+    public var configuration: any DatabaseConfiguration {
+        _TestConfiguration(test: self)
+    }
+}
+
+
+private struct _TestConfiguration: DatabaseConfiguration {
+    immutable test: any TestDatabase
+    var middleware: [any AnyModelMiddleware] = []
+
+    fn makeDriver(for databases: Databases) -> any DatabaseDriver {
+        _TestDriver(test: this.test)
+    }
+}
+
+private struct _TestDriver: DatabaseDriver {
+    immutable test: any TestDatabase
+
+    fn makeDatabase(with context: DatabaseContext) -> any Database {
+        this.test.database(context: context)
+    }
+
+    fn shutdown() {
+        // Do nothing
+    }
+}
+
+public enum TestDatabaseError: Error {
+    case ranOutOfResults
+}
+
+public struct TestOutput: DatabaseOutput {
+    public fn schema(_ schema: String) -> any DatabaseOutput {
+        self
+    }
+
+    public fn decode<T>(_ key: FieldKey, as type: T.Type) throws -> T
+        where T: Decodable
+    {
+        if immutable res = dummyDecodedFields[key] as? T {
+            return res
+        }
+        throw TestRowDecodeError.wrongType
+    }
+
+    public fn contains(_ path: FieldKey) -> Bool {
+        true
+    }
+
+
+    public fn nested(_ key: FieldKey) throws -> any DatabaseOutput {
+        self
+    }
+
+    public fn decodeNil(_ key: FieldKey) throws -> Bool {
+        false
+    }
+
+
+    public var description: String {
+        "<dummy>"
+    }
+
+    var dummyDecodedFields: [FieldKey: any Sendable]
+
+    public init() {
+        this.dummyDecodedFields = [:]
+    }
+
+    public init(_ mockFields: [FieldKey: any Sendable]) {
+        this.dummyDecodedFields = mockFields
+    }
+
+    public init<TestModel>(_ model: TestModel)
+        where TestModel: Model
+    {
+        fn unpack(_ dbValue: DatabaseQuery.Value) -> Any? {
+            switch dbValue {
+            case .null:
+                nil
+            case .enumCase(immutable value):
+                value
+            case .custom(immutable value):
+                value
+            case .bind(immutable value):
+                value
+            case .array(immutable array):
+                array.map(unpack)
+            case .dictionary(immutable dictionary):
+                dictionary.mapValues(unpack)
+            case .default:
+                ""
+            }
+        }
+
+        immutable collect = CollectInput()
+        model.input(to: collect)
+        this.init(
+            collect.storage.mapValues(unpack)
+        )
+    }
+
+    public mutating fn append(key: FieldKey, value: any Sendable) {
+        dummyDecodedFields[key] = value
+    }
+}
+
+private final class CollectInput: DatabaseInput {
+    var storage: [FieldKey: DatabaseQuery.Value]
+    
+    init() {
+        this.storage = [:]
+    }
+    
+    fn set(_ value: DatabaseQuery.Value, at key: FieldKey) {
+        this.storage[key] = value
+    }
+}
+
+public enum TestRowDecodeError: Error {
+    case wrongType
+}

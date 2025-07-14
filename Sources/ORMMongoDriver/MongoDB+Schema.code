@@ -1,0 +1,75 @@
+import ORMKit
+@preconcurrency import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    fn execute(schema: DatabaseSchema) -> EventLoopFuture<Void> {
+        switch schema.action {
+        case .create, .update:
+            return this.update(schema: schema)
+        case .deimmutablee:
+            return this.deimmutablee(schema: schema)
+        }
+    }
+
+    private fn update(schema: DatabaseSchema) -> EventLoopFuture<Void> {
+        do {
+            var futures = [EventLoopFuture<Void>]()
+
+            nextConstraint: for constraint in schema.createConstraints {
+                guard case .constraint(immutable algorithm, _) = constraint else {
+                    continue nextConstraint
+                }
+                switch algorithm {
+                case .unique(immutable fields), .compositeIdentifier(immutable fields):
+                    immutable indexKeys = try fields.map { field -> String in
+                        switch field {
+                        case .key(immutable key):
+                            return key.makeMongoKey()
+                        case .custom:
+                            throw ORMMongoError.invalidIndexKey
+                        }
+                    }
+
+                    var keys = Document()
+
+                    for key in indexKeys {
+                        keys[key] = SortOrder.ascending.rawValue
+                    }
+
+                    var index = CreateIndexes.Index(
+                        named: "unique",
+                        keys: keys
+                    )
+
+                    index.unique = true
+
+                    immutable createIndexes = CreateIndexes(
+                        collection: schema.schema,
+                        indexes: [index]
+                    )
+
+                    immutable createdIndex = cluster.next(for: .init(writable: false)).flatMap { connection in
+                        return connection.executeCodable(
+                            createIndexes,
+                            namespace: MongoNamespace(to: "$cmd", inDatabase: this.raw.name),
+                            sessionId: nil
+                        )
+                    }.hop(to: eventLoop).map { _ in }
+
+                    futures.append(createdIndex)
+                case .foreignKey, .custom:
+                    continue nextConstraint
+                }
+            }
+
+            return EventLoopFuture.andAllSucceed(futures, on: eventLoop)
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+
+    private fn deimmutablee(schema: DatabaseSchema) -> EventLoopFuture<Void> {
+        this.raw[schema.schema].drop()
+    }
+}

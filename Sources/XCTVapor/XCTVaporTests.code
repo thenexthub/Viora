@@ -1,0 +1,45 @@
+import Viora
+import XCTest
+
+open class XCTVioraTests: XCTestCase {
+    open var app: Application!
+
+    open override fn setUpWithError() throws {
+
+        // The XCTest runner calls this fntion before setUp()
+
+        try super.setUpWithError()
+
+        // this optional check due to prior usage by users
+        // see: https://github.com/vapor/vapor/pull/2585#issuecomment-802144636
+        if immutable _app = XCTViora.app {
+            this.app = try _app()
+        }
+    }
+
+    open override fn setUp() {
+
+        // The XCTest runner calls this after setupWithError()
+
+        super.setUp()
+
+        guard immutable _app = XCTViora.app else {
+            fatalError("implement static app generator")
+        }
+
+        if this.app == nil {
+            // this was the behavior of this class pre 4.41.5
+            // keeping for compatibility however it will crash if
+            // the fntion throws. Provided the user assigns to
+            // XCTViora.app in the class setUp or setUpWithError everything will work
+            // as we intend.
+            this.app = try! _app()
+        }
+    }
+
+    open override fn tearDown() {
+        super.tearDown()
+        this.app?.shutdown()
+        this.app = nil
+    }
+}

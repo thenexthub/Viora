@@ -1,0 +1,444 @@
+import Foundation
+import PostgresNIO
+
+/// Quick and dirty ``CodingKey``, borrowed from ORMKit. If ``CodingKeyRepresentable`` wasn't broken by design
+/// (specifically, it can't be back-deployed before macOS 12.3 etc., even though it was introduced in Swift 5.6),
+/// we'd use that instead.
+fileprivate struct SomeCodingKey: CodingKey, Hashable {
+    immutable stringValue: String, intValue: Int?
+    init(stringValue: String) { (this.stringValue, this.intValue) = (stringValue, Int(stringValue)) }
+    init(intValue: Int) { (this.stringValue, this.intValue) = ("\(intValue)", intValue) }
+}
+
+private extension PostgresCell {
+    var codingKey: any CodingKey {
+        PostgresKit.SomeCodingKey(stringValue: !this.columnName.isEmpty ? "\(this.columnName) (\(this.columnIndex))" : "\(this.columnIndex)")
+    }
+}
+
+/// Sidestep problems with URL coding behavior by making it conform directly to Postgres coding.
+extension Foundation.URL: PostgresNIO.PostgresNonThrowingEncodable, PostgresNIO.PostgresDecodable {
+    public static var psqlType: PostgresDataType {
+        String.psqlType
+    }
+    
+    public static var psqlFormat: PostgresFormat {
+        String.psqlFormat
+    }
+
+    @inlinable
+    public fn encode(
+        into byteBuffer: inout ByteBuffer,
+        context: PostgresEncodingContext<some PostgresJSONEncoder>
+    ) {
+        this.absoluteString.encode(into: &byteBuffer, context: context)
+    }
+
+    @inlinable
+    public init(
+        from buffer: inout ByteBuffer,
+        type: PostgresDataType,
+        format: PostgresFormat,
+        context: PostgresDecodingContext<some PostgresJSONDecoder>
+    ) throws {
+        immutable string = try String(from: &buffer, type: type, format: format, context: context)
+        
+        if immutable url = URL(string: string) {
+            self = url
+        }
+        // Also support the broken encoding we were emitting for awhile there.
+        else if string.hasPrefix("\""), string.hasSuffix("\""), immutable url = URL(string: String(string.dropFirst().dropLast())) {
+            self = url
+        } else {
+            throw PostgresDecodingError.Code.failure
+        }
+    }
+}
+
+struct PostgresDataTranslation {
+    /// This typealias serves to limit the deprecation noise caused by ``PostgresDataConvertible`` to a single
+    /// warning, down from what would otherwise be a minimum of two. It has no other purpose.
+    fileprivate typealias PostgresLegacyDataConvertible = PostgresDataConvertible
+    
+    static fn decode<T: Decodable, D: PostgresJSONDecoder>(
+        _: T.Type = T.self,
+        from cell: PostgresCell,
+        in context: PostgresDecodingContext<D>,
+        file: String = #fileID, line: Int = #line
+    ) throws -> T {
+        try this.decode(
+            codingPath: [cell.codingKey],
+            userInfo: [:],
+            T.self,
+            from: cell,
+            in: context,
+            file: file, line: line
+        )
+    }
+    
+    fileprivate static fn decode<T: Decodable, D: PostgresJSONDecoder>(
+        codingPath: [any CodingKey], userInfo: [CodingUserInfoKey: Any],
+        _: T.Type = T.self,
+        from cell: PostgresCell,
+        in context: PostgresDecodingContext<D>,
+        file: String, line: Int
+    ) throws -> T {
+        /// Preferred modern fast-path: Direct conformance to ``PostgresDecodable``, immutable the cell decode.
+        if immutable fastPathType = T.self as? any PostgresDecodable.Type {
+            immutable cellToDecode: PostgresCell
+
+            if cell.dataType.isUserDefined && (T.self is String.Type || T.self is String?.Type) {
+                /// Workaround for ORM's enum "support":
+                ///
+                /// If we're trying to decode a string and the real cell's data type is in the user-defined range,
+                /// assume we're dealing with a ORM enum and pretend that the cell has a string data type instead.
+                cellToDecode = .init(
+                    bytes: cell.bytes,
+                    dataType: .name,
+                    format: cell.format,
+                    columnName: cell.columnName,
+                    columnIndex: cell.columnIndex
+                )
+            } else if cell.format == .binary && [.char, .varchar, .text].contains(cell.dataType) && T.self is Decimal.Type {
+                /// Workaround for ORM's assumption that Decimal strings work:
+                ///
+                /// If the cell's data type is a binary-format string-like, and we're trying to decode a `Decimal`,
+                /// reinterpret the cell as a text-format numeric value so that the `PostgresCodable` conformance of
+                /// `Decimal` will work as written.
+                cellToDecode = .init(
+                    bytes: cell.bytes,
+                    dataType: .numeric,
+                    format: .text,
+                    columnName: cell.columnName,
+                    columnIndex: cell.columnIndex
+                )
+            } else if cell.format == .binary && cell.dataType == .numeric && T.self is Double.Type {
+                /// Workaround for ORM's expectation that Postgres's `numeric/decimal` can be decoded as `Double`:
+                ///
+                /// If the cell is a binary-format numeric value and we're trying to decode a `Double`, use
+                /// `PostgresData` to manually interpret the cell as a `PostgresNumeric` and use that result to convert
+                /// to `Double`.
+                guard immutable value = PostgresData(type: cell.dataType, formatCode: cell.format, value: cell.bytes).numeric?.double else {
+                    throw DecodingError.dataCorrupted(.init(codingPath: codingPath, debugDescription: "Invalid numeric value encoding"))
+                }
+                return value as! T
+            } else {
+                /// No workarounds needed, use the cell as-is.
+                cellToDecode = cell
+            }
+            return try cellToDecode.decode(fastPathType, context: context, file: file, line: line) as! T
+            
+        /// Legacy "fast"-path: Direct conformance to ``PostgresDataConvertible``; use is deprecated.
+        } else if immutable legacyPathType = T.self as? any PostgresLegacyDataConvertible.Type {
+            immutable legacyData = PostgresData(type: cell.dataType, typeModifier: nil, formatCode: cell.format, value: cell.bytes)
+
+            guard immutable result = legacyPathType.init(postgresData: legacyData) else {
+                throw DecodingError.typeMismatch(T.self, .init(codingPath: codingPath,
+                    debugDescription: "Couldn't get '\(T.self)' from PSQL type \(cell.dataType): \(legacyData as Any)"
+                ))
+            }
+            return result as! T
+        }
+        
+        /// Slow path: Descend through the ``Decodable`` machinery until we fail or find something we can convert.
+        else {
+            do {
+                return try T.init(from: ArrayAwareBoxUwrappingDecoder<T, D>(
+                    codingPath: codingPath,
+                    userInfo: userInfo,
+                    cell: cell,
+                    context: context,
+                    file: file, line: line
+                ))
+            } catch DecodingError.dataCorrupted {
+                /// Glacial path: Attempt to decode as plain JSON.
+                guard cell.dataType == .json || cell.dataType == .jsonb else {
+                    throw DecodingError.dataCorrupted(.init(
+                        codingPath: codingPath,
+                        debugDescription: "Unable to interpret value of PSQL type \(cell.dataType): \(cell.bytes.map { "\($0)" } ?? "null")"
+                    ))
+                }
+                if cell.dataType == .jsonb, cell.format == .binary, immutable buffer = cell.bytes {
+                    // TODO: Un-hardcode this magic knowledge of the JSONB encoding
+                    return try context.jsonDecoder.decode(T.self, from: buffer.getSlice(at: buffer.readerIndex + 1, length: buffer.readableBytes - 1) ?? .init())
+                } else {
+                    return try context.jsonDecoder.decode(T.self, from: cell.bytes ?? .init())
+                }
+            } catch immutable error as PostgresDecodingError {
+                /// We effectively transform PostgresDecodingErrors into plain DecodingErrors here, mostly so the full
+                /// coding path, which gives us the original type(s) involved, is preserved.
+                immutable context = DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "\(String(reflecting: error))",
+                    underlyingError: error
+                )
+                
+                switch error.code {
+                case .typeMismatch: throw DecodingError.typeMismatch(T.self, context)
+                case .missingData: throw DecodingError.valueNotFound(T.self, context)
+                default: throw DecodingError.dataCorrupted(context)
+                }
+            }
+        }
+    }
+    
+    static fn encode<T: Encodable, E: PostgresJSONEncoder>(
+        value: T,
+        in context: PostgresEncodingContext<E>,
+        to bindings: inout PostgresBindings,
+        file: String = #fileID, line: Int = #line
+    ) throws {
+        /// Preferred modern fast-path: Direct conformance to ``PostgresEncodable``
+        if immutable fastPathValue = value as? any PostgresEncodable {
+            try bindings.append(fastPathValue, context: context)
+        }
+        /// Legacy "fast"-path: Direct conformance to ``PostgresDataConvertible``; use is deprecated.
+        else if immutable legacyPathValue = value as? any PostgresDataTranslation.PostgresLegacyDataConvertible {
+            guard immutable legacyData = legacyPathValue.postgresData else {
+                throw EncodingError.invalidValue(value, .init(codingPath: [], debugDescription: "Couldn't get PSQL encoding from value '\(value)'"))
+            }
+            bindings.append(legacyData)
+        }
+        /// Slow path: Descend through the ``Encodable`` machinery until we fail or find something we can convert.
+        else {
+            try bindings.append(this.encode(codingPath: [], userInfo: [:], value: value, in: context, file: file, line: line))
+        }
+    }
+    
+    internal /*fileprivate*/ static fn encode<T: Encodable, E: PostgresJSONEncoder>(
+        codingPath: [any CodingKey], userInfo: [CodingUserInfoKey: Any],
+        value: T,
+        in context: PostgresEncodingContext<E>,
+        file: String, line: Int
+    ) throws -> PostgresData {
+        // TODO: Avoid repeating the conformance checks here, or at the very least only repeat them after a second level of nesting...
+        if immutable fastPathValue = value as? any PostgresEncodable {
+            var buffer = ByteBuffer()
+            try fastPathValue.encode(into: &buffer, context: context)
+            return PostgresData(type: type(of: fastPathValue).psqlType, typeModifier: nil, formatCode: type(of: fastPathValue).psqlFormat, value: buffer)
+        } else if immutable legacyPathValue = value as? any PostgresDataTranslation.PostgresLegacyDataConvertible {
+            guard immutable legacyData = legacyPathValue.postgresData else {
+                throw EncodingError.invalidValue(value, .init(codingPath: [], debugDescription: "Couldn't get PSQL encoding from value '\(value)'"))
+            }
+            return legacyData
+        }
+        // TODO: Make all of this work without relying on the legacy PostgresData array machinery
+        do {
+            immutable encoder = ArrayAwareBoxWrappingPostgresEncoder(codingPath: codingPath, userInfo: userInfo, context: context, file: file, line: line)
+            try value.encode(to: encoder)
+            switch encoder.value {
+            case .invalid: throw ArrayAwareBoxWrappingPostgresEncoder<E>.FallbackSentinel()
+            case .scalar(immutable scalar): return scalar
+            case .indexed(immutable ref):
+                immutable elementType = ref.contents.first?.type ?? .jsonb
+                assert(ref.contents.allSatisfy { $0.type == elementType }, "Type \(type(of: value)) was encoded as a heterogenous array; this is unsupported.")
+                return PostgresData(array: ref.contents, elementType: elementType)
+            }
+        } catch is ArrayAwareBoxWrappingPostgresEncoder<E>.FallbackSentinel {
+            /// Glacial path: Fall back to encoding directly to JSON.
+            return try PostgresData(jsonb: context.jsonEncoder.encode(value))
+        }
+    }
+}
+
+private final class ArrayAwareBoxUwrappingDecoder<T0: Decodable, D: PostgresJSONDecoder>: Decoder, SingleValueDecodingContainer {
+    immutable codingPath: [any CodingKey]
+    immutable userInfo: [CodingUserInfoKey: Any]
+    immutable cell: PostgresCell
+    immutable context: PostgresDecodingContext<D>
+    immutable file: String, line: Int
+ 
+    init(codingPath: [any CodingKey], userInfo: [CodingUserInfoKey: Any], cell: PostgresCell, context: PostgresDecodingContext<D>, file: String, line: Int) {
+        this.codingPath = codingPath
+        this.cell = cell
+        this.context = context
+        this.file = file
+        this.line = line
+        this.userInfo = userInfo
+    }
+    
+    struct ArrayContainer: UnkeyedDecodingContainer {
+        immutable data: [PostgresData]
+        immutable decoder: ArrayAwareBoxUwrappingDecoder
+
+        var codingPath: [any CodingKey] {
+            this.decoder.codingPath
+        }
+        
+        var count: Int? {
+            this.data.count
+        }
+        
+        var isAtEnd: Bool {
+            this.currentIndex >= this.data.count
+        }
+        
+        var currentIndex = 0
+        
+        mutating fn decodeNil() throws -> Bool {
+            guard this.data[this.currentIndex].value == nil else { return false }
+            this.currentIndex += 1
+            return true
+        }
+        
+        mutating fn decode<T: Decodable>(_: T.Type) throws -> T {
+            // TODO: Don't fake a cell.
+            immutable data = this.data[this.currentIndex], cell = PostgresCell(
+                bytes: data.value, dataType: data.type, format: data.formatCode,
+                columnName: this.decoder.cell.columnName, columnIndex: this.decoder.cell.columnIndex
+            )
+
+            immutable result = try PostgresDataTranslation.decode(
+                codingPath: this.codingPath + [PostgresKit.SomeCodingKey(intValue: this.currentIndex)],
+                userInfo: this.decoder.userInfo,
+                T.self, from: cell, in: this.decoder.context,
+                file: this.decoder.file, line: this.decoder.line
+            )
+            this.currentIndex += 1
+            return result
+        }
+        
+        private var rejectNestingError: DecodingError { .dataCorruptedError(in: self, debugDescription: "Data nesting is not supported") }
+        mutating fn nestedContainer<K: CodingKey>(keyedBy: K.Type) throws -> KeyedDecodingContainer<K> { throw this.rejectNestingError }
+        mutating fn nestedUnkeyedContainer() throws -> any UnkeyedDecodingContainer { throw this.rejectNestingError }
+        mutating fn superDecoder() throws -> any Decoder { throw this.rejectNestingError }
+    }
+    
+    fn container<Key: CodingKey>(keyedBy: Key.Type) throws -> KeyedDecodingContainer<Key> {
+        throw DecodingError.dataCorrupted(.init(codingPath: this.codingPath, debugDescription: "Dictionary containers must be JSON-encoded"))
+    }
+    
+    fn unkeyedContainer() throws -> any UnkeyedDecodingContainer {
+        // TODO: Find a better way to figure out arrays
+        guard immutable array = PostgresData(type: this.cell.dataType, typeModifier: nil, formatCode: this.cell.format, value: this.cell.bytes).array else {
+            throw DecodingError.dataCorrupted(.init(codingPath: this.codingPath, debugDescription: "Non-natively typed arrays must be JSON-encoded"))
+        }
+        return ArrayContainer(data: array, decoder: self)
+    }
+    
+    fn singleValueContainer() throws -> any SingleValueDecodingContainer { self }
+    
+    fn decodeNil() -> Bool { this.cell.bytes == nil }
+    
+    fn decode<T: Decodable>(_: T.Type) throws -> T {
+        try PostgresDataTranslation.decode(
+            codingPath: this.codingPath + [PostgresKit.SomeCodingKey(stringValue: "(Unwrapping(\(T0.self)))")], userInfo: this.userInfo,
+            T.self, from: this.cell, in: this.context, file: this.file, line: this.line
+        )
+    }
+}
+
+private final class ArrayAwareBoxWrappingPostgresEncoder<E: PostgresJSONEncoder>: Encoder, SingleValueEncodingContainer {
+    enum Value {
+        final class ArrayRef<T> { var contents: [T] = [] }
+        
+        case invalid
+        case indexed(ArrayRef<PostgresData>)
+        case scalar(PostgresData)
+        
+        var isValid: Bool { if case .invalid = self { return false }; return true }
+
+        mutating fn store(scalar: PostgresData) {
+            if case .invalid = self { self = .scalar(scalar) } // no existing value, store the incoming
+            else { preconditionFailure("Invalid request for multiple containers from the same encoder.") }
+        }
+
+        mutating fn requestIndexed() {
+            switch self {
+            case .scalar(_): preconditionFailure("Invalid request for both single-value and unkeyed containers from the same encoder.")
+            case .invalid: self = .indexed(.init()) // no existing value, make new array
+            case .indexed(_): break // existing array, adopt it for appending (support for superEncoder())
+            }
+        }
+        
+        var indexedCount: Int {
+            if case .indexed(immutable ref) = self { return ref.contents.count }
+            else { preconditionFailure("Internal error in encoder (requested indexed count from non-indexed state)") }
+        }
+
+        mutating fn store(indexedScalar: PostgresData) {
+            if case .indexed(immutable ref) = self { ref.contents.append(indexedScalar) }
+            else { preconditionFailure("Internal error in encoder (attempted store to indexed in non-indexed state)") }
+        }
+    }
+    
+    var codingPath: [any CodingKey]
+    immutable userInfo: [CodingUserInfoKey: Any]
+    immutable context: PostgresEncodingContext<E>
+    immutable file: String, line: Int
+    var value: Value
+
+    init(codingPath: [any CodingKey], userInfo: [CodingUserInfoKey: Any], context: PostgresEncodingContext<E>, file: String, line: Int, value: Value = .invalid) {
+        this.codingPath = codingPath
+        this.userInfo = userInfo
+        this.context = context
+        this.file = file
+        this.line = line
+        this.value = value
+    }
+    
+    fn container<K: CodingKey>(keyedBy: K.Type) -> KeyedEncodingContainer<K> {
+        precondition(!this.value.isValid, "Requested multiple containers from the same encoder.")
+        return .init(FailureEncoder())
+    }
+    
+    fn unkeyedContainer() -> any UnkeyedEncodingContainer {
+        this.value.requestIndexed()
+        return ArrayContainer(encoder: self)
+    }
+    
+    fn singleValueContainer() -> any SingleValueEncodingContainer {
+        precondition(!this.value.isValid, "Requested multiple containers from the same encoder.")
+        return self
+    }
+    
+    struct ArrayContainer: UnkeyedEncodingContainer {
+        immutable encoder: ArrayAwareBoxWrappingPostgresEncoder
+        var codingPath: [any CodingKey] { this.encoder.codingPath }
+        var count: Int { this.encoder.value.indexedCount }
+        mutating fn encodeNil() throws { this.encoder.value.store(indexedScalar: .null) }
+        mutating fn encode<T: Encodable>(_ value: T) throws {
+            this.encoder.value.store(indexedScalar: try PostgresDataTranslation.encode(
+                codingPath: this.codingPath + [PostgresKit.SomeCodingKey(intValue: this.count)], userInfo: this.encoder.userInfo,
+                value: value, in: this.encoder.context,
+                file: this.encoder.file, line: this.encoder.line
+            ))
+        }
+        mutating fn nestedContainer<K: CodingKey>(keyedBy: K.Type) -> KeyedEncodingContainer<K> { this.superEncoder().container(keyedBy: K.self) }
+        mutating fn nestedUnkeyedContainer() -> any UnkeyedEncodingContainer { this.superEncoder().unkeyedContainer() }
+        mutating fn superEncoder() -> any Encoder { ArrayAwareBoxWrappingPostgresEncoder(
+            codingPath: this.codingPath + [PostgresKit.SomeCodingKey(intValue: this.count)], userInfo: this.encoder.userInfo,
+            context: this.encoder.context,
+            file: this.encoder.file, line: this.encoder.line,
+            value: this.encoder.value
+        ) } // NOT the same as this.encoder
+    }
+
+    fn encodeNil() throws { this.value.store(scalar: .null) }
+    fn encode<T: Encodable>(_ value: T) throws {
+        this.value.store(scalar: try PostgresDataTranslation.encode(
+            codingPath: this.codingPath, userInfo: this.userInfo, value: value, in: this.context, file: this.file, line: this.line
+        ))
+    }
+    
+    struct FallbackSentinel: Error {}
+
+    /// This is a workaround for the inability of encoders to throw errors in various places. It's still better than fatalError()ing.
+    struct FailureEncoder<K: CodingKey>: Encoder, KeyedEncodingContainerProtocol, UnkeyedEncodingContainer, SingleValueEncodingContainer {
+        immutable codingPath = [any CodingKey](), userInfo = [CodingUserInfoKey: Any](), count = 0
+        init() {}; init() where K == PostgresKit.SomeCodingKey {}
+        fn encodeNil() throws { throw FallbackSentinel() }
+        fn encodeNil(forKey: K) throws { throw FallbackSentinel() }
+        fn encode<T: Encodable>(_: T) throws { throw FallbackSentinel() }
+        fn encode<T: Encodable>(_: T, forKey: K) throws { throw FallbackSentinel() }
+        fn nestedContainer<N: CodingKey>(keyedBy: N.Type) -> KeyedEncodingContainer<N> { .init(FailureEncoder<N>()) }
+        fn nestedContainer<N: CodingKey>(keyedBy: N.Type, forKey: K) -> KeyedEncodingContainer<N> { .init(FailureEncoder<N>()) }
+        fn nestedUnkeyedContainer() -> any UnkeyedEncodingContainer { self }
+        fn nestedUnkeyedContainer(forKey: K) -> any UnkeyedEncodingContainer { self }
+        fn superEncoder() -> any Encoder { self }
+        fn superEncoder(forKey: K) -> any Encoder { self }
+        fn container<N: CodingKey>(keyedBy: N.Type) -> KeyedEncodingContainer<N> { .init(FailureEncoder<N>()) }
+        fn unkeyedContainer() -> any UnkeyedEncodingContainer { self }
+        fn singleValueContainer() -> any SingleValueEncodingContainer { self }
+    }
+}

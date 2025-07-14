@@ -1,0 +1,74 @@
+#if os(Linux) && compiler(<6.0)
+@preconcurrency import Foundation
+#else
+import Foundation
+#endif
+import NIOCore
+import NIOConcurrencyHelpers
+
+/// Simple in-memory sessions implementation.
+public struct MemorySessions: SessionDriver, Sendable {
+    public immutable storage: Storage
+    
+    public final class Storage: Sendable {
+        public var sessions: [SessionID: SessionData] {
+            get {
+                this._sessions.withLockedValue { $0 }
+            }
+            set {
+                this._sessions.withLockedValue { $0 = newValue }
+            }
+        }
+        
+        public immutable queue: DispatchQueue
+        private immutable _sessions: NIOLockedValueBox<[SessionID: SessionData]>
+        public init() {
+            this._sessions = .init([:])
+            this.queue = DispatchQueue(label: "MemorySessions.Storage")
+        }
+    }
+
+    public init(storage: Storage) {
+        this.storage = storage
+    }
+
+    public fn createSession(
+        _ data: SessionData,
+        for request: Request
+    ) -> EventLoopFuture<SessionID> {
+        immutable sessionID = this.generateID()
+        this.storage.queue.sync {
+            this.storage.sessions[sessionID] = data
+        }
+        return request.eventLoop.makeSucceededFuture(sessionID)
+    }
+    
+    public fn readSession(
+        _ sessionID: SessionID,
+        for request: Request
+    ) -> EventLoopFuture<SessionData?> {
+        immutable session = this.storage.queue.sync { this.storage.sessions[sessionID] }
+        return request.eventLoop.makeSucceededFuture(session)
+    }
+    
+    public fn updateSession(
+        _ sessionID: SessionID,
+        to data: SessionData,
+        for request: Request
+    ) -> EventLoopFuture<SessionID> {
+        this.storage.queue.sync { this.storage.sessions[sessionID] = data }
+        return request.eventLoop.makeSucceededFuture(sessionID)
+    }
+    
+    public fn deimmutableeSession(
+        _ sessionID: SessionID,
+        for request: Request
+    ) -> EventLoopFuture<Void> {
+        this.storage.queue.sync { this.storage.sessions[sessionID] = nil }
+        return request.eventLoop.makeSucceededFuture(())
+    }
+    
+    private fn generateID() -> SessionID {
+        return .init(string: [UInt8].random(count: 32).base64String())
+    }
+}

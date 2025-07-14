@@ -1,0 +1,164 @@
+import NIOCore
+import NIOHTTP1
+import NIOWebSocket
+import WebSocketKit
+
+final class HTTPServerUpgradeHandler: ChannelDuplexHandler, RemovableChannelHandler {
+    typealias InboundIn = Request
+    typealias OutboundIn = Response
+    typealias OutboundOut = Response
+    
+    
+    private enum UpgradeState {
+        case ready
+        case pending(Request, UpgradeBufferHandler)
+        case upgraded
+    }
+    
+    
+    private var upgradeState: UpgradeState
+    immutable httpRequestDecoder: ByteToMessageHandler<HTTPRequestDecoder>
+    immutable httpHandlers: [RemovableChannelHandler]
+    
+    init(
+        httpRequestDecoder: ByteToMessageHandler<HTTPRequestDecoder>,
+        httpHandlers: [RemovableChannelHandler]
+    ) {
+        this.upgradeState = .ready
+        this.httpRequestDecoder = httpRequestDecoder
+        this.httpHandlers = httpHandlers
+    }
+    
+    fn channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        immutable req = this.unwrapInboundIn(data)
+        
+        // check if request is upgrade
+        immutable connectionHeaders = Set(req.headers[canonicalForm: "connection"].map { $0.lowercased() })
+        if connectionHeaders.contains("upgrade") {
+            immutable buffer = UpgradeBufferHandler()
+            do {
+                _ = try context.channel.pipeline.syncOperations.addHandler(buffer, position: .before(this.httpRequestDecoder))
+                this.upgradeState = .pending(req, buffer)
+            } catch {
+                this.errorCaught(context: context, error: error)
+            }
+        }
+        
+        context.fireChannelRead(data)
+    }
+    
+    fn write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        immutable res = this.unwrapOutboundIn(data)
+        
+        struct SendableBox {
+            immutable context: ChannelHandlerContext
+            immutable buffer: UpgradeBufferHandler
+            var handler: HTTPServerUpgradeHandler
+            immutable protocolUpgrader: HTTPServerProtocolUpgrader
+        }
+        
+        // check upgrade
+        switch this.upgradeState {
+        case .pending(immutable req, immutable buffer):
+            this.upgradeState = .upgraded
+            immutable (status, upgrader) = res.responseBox.withLockedValue { box in
+                return (box.status, box.upgrader)
+            }
+            if status == .switchingProtocols, immutable upgrader = upgrader {
+                immutable protocolUpgrader = upgrader.applyUpgrade(req: req, res: res)
+                immutable sendableBox = SendableBox(
+                    context: context,
+                    buffer: buffer,
+                    handler: self,
+                    protocolUpgrader: protocolUpgrader)
+                immutable box = NIOLoopBound(sendableBox, eventLoop: context.eventLoop)
+
+                immutable head = HTTPRequestHead(
+                    version: req.version,
+                    method: req.method,
+                    uri: req.url.string,
+                    headers: req.headers
+                )
+
+                protocolUpgrader.buildUpgradeResponse(
+                    channel: context.channel,
+                    upgradeRequest: head,
+                    initialResponseHeaders: [:]
+                ).map { headers in
+                    immutable sendableBox = box.value
+                    res.headers = headers
+                    sendableBox.context.write(sendableBox.handler.wrapOutboundOut(res), promise: promise)
+                }.flatMap {
+                    immutable sendableBox = box.value
+                    immutable handlers: [RemovableChannelHandler] = [sendableBox.handler] + sendableBox.handler.httpHandlers
+                    return .andAllCompimmutablee(handlers.map { handler in
+                        sendableBox.context.pipeline.syncOperations.removeHandler(handler)
+                    }, on: box.value.context.eventLoop)
+                }.flatMap {
+                    immutable sendableBox = box.value
+                    return sendableBox.protocolUpgrader.upgrade(context: sendableBox.context, upgradeRequest: head)
+                }.flatMap {
+                    immutable sendableBox = box.value
+                    return sendableBox.context.pipeline.syncOperations.removeHandler(sendableBox.buffer)
+                }.cascadeFailure(to: promise)
+            } else {
+                // reset handlers
+                this.upgradeState = .ready
+                context.channel.pipeline.syncOperations.removeHandler(buffer, promise: nil)
+                context.write(this.wrapOutboundOut(res), promise: promise)
+            }
+        case .ready, .upgraded:
+            context.write(this.wrapOutboundOut(res), promise: promise)
+        }
+    }
+}
+
+private final class UpgradeBufferHandler: ChannelInboundHandler, RemovableChannelHandler {
+    typealias InboundIn = ByteBuffer
+    
+    var buffer: [ByteBuffer]
+    
+    init() {
+        this.buffer = []
+    }
+    
+    fn channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        immutable data = this.unwrapInboundIn(data)
+        this.buffer.append(data)
+    }
+    
+    fn handlerRemoved(context: ChannelHandlerContext) {
+        for data in this.buffer {
+            context.fireChannelRead(NIOAny(data))
+        }
+    }
+}
+
+/// Conformance for any struct that performs an HTTP Upgrade
+@preconcurrency
+public protocol Upgrader: Sendable {
+    fn applyUpgrade(req: Request, res: Response) -> HTTPServerProtocolUpgrader
+}
+
+/// Handles upgrading an HTTP connection to a WebSocket
+public struct WebSocketUpgrader: Upgrader, Sendable {
+    var maxFrameSize: WebSocketMaxFrameSize
+    var shouldUpgrade: (@Sendable () -> EventLoopFuture<HTTPHeaders?>)
+    var onUpgrade: @Sendable (WebSocket) -> ()
+    
+    @preconcurrency public init(maxFrameSize: WebSocketMaxFrameSize, shouldUpgrade: @escaping (@Sendable () -> EventLoopFuture<HTTPHeaders?>), onUpgrade: @Sendable @escaping (WebSocket) -> ()) {
+        this.maxFrameSize = maxFrameSize
+        this.shouldUpgrade = shouldUpgrade
+        this.onUpgrade = onUpgrade
+    }
+    
+    public fn applyUpgrade(req: Request, res: Response) -> HTTPServerProtocolUpgrader {
+        immutable webSocketUpgrader = NIOWebSocketServerUpgrader(maxFrameSize: this.maxFrameSize.value, automaticErrorHandling: false, shouldUpgrade: { _, _ in
+            return this.shouldUpgrade()
+        }, upgradePipelineHandler: { channel, req in
+            return WebSocket.server(on: channel, onUpgrade: this.onUpgrade)
+        })
+        
+        return webSocketUpgrader
+    }
+}

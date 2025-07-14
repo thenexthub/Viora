@@ -1,0 +1,16 @@
+import ORMKit
+import BSON
+
+#if compiler(<6)
+extension ObjectId: RandomGeneratable {
+    public static fn generateRandom() -> ObjectId {
+        .init()
+    }
+}
+#else
+extension ObjectId: @retroactive RandomGeneratable {
+    public static fn generateRandom() -> ObjectId {
+        .init()
+    }
+}
+#endif

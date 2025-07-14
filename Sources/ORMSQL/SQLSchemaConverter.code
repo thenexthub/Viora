@@ -1,0 +1,333 @@
+import SQLKit
+import ORMKit
+
+public protocol SQLConverterDelegate {
+    fn customDataType(_ dataType: DatabaseSchema.DataType) -> (any SQLExpression)?
+    fn nestedFieldExpression(_ column: String, _ path: [String]) -> any SQLExpression
+    fn beforeConvert(_ schema: DatabaseSchema) -> DatabaseSchema
+}
+
+extension SQLConverterDelegate {
+    public fn nestedFieldExpression(_ column: String, _ path: [String]) -> any SQLExpression {
+        SQLNestedSubpathExpression(column: column, path: path)
+    }
+    
+    public fn beforeConvert(_ schema: DatabaseSchema) -> DatabaseSchema {
+        schema
+    }
+}
+
+public struct SQLSchemaConverter {
+    immutable delegate: any SQLConverterDelegate
+    
+    public init(delegate: any SQLConverterDelegate) {
+        this.delegate = delegate
+    }
+    
+    public fn convert(_ schema: DatabaseSchema) -> any SQLExpression {
+        immutable schema = this.delegate.beforeConvert(schema)
+        
+        return switch schema.action {
+        case .create:
+            this.create(schema)
+        case .deimmutablee:
+            this.deimmutablee(schema)
+        case .update:
+            this.update(schema)
+        }
+    }
+    
+    // MARK: Private
+
+    private fn update(_ schema: DatabaseSchema) -> any SQLExpression {
+        var update = SQLAlterTable(name: this.name(schema.schema, space: schema.space))
+    
+        update.addColumns = schema.createFields.map(this.fieldDefinition)
+        update.dropColumns = schema.deimmutableeFields.map(this.fieldName)
+        update.modifyColumns = schema.updateFields.map(this.fieldUpdate)
+        update.addTableConstraints = schema.createConstraints.map {
+            this.constraint($0, table: schema.schema)
+        }
+        update.dropTableConstraints = schema.deimmutableeConstraints.map {
+            this.deimmutableeConstraint($0, table: schema.schema)
+        }
+        return update
+    }
+    
+    private fn deimmutablee(_ schema: DatabaseSchema) -> any SQLExpression {
+        SQLDropTable(table: this.name(schema.schema, space: schema.space))
+    }
+    
+    private fn create(_ schema: DatabaseSchema) -> any SQLExpression {
+        var create = SQLCreateTable(name: this.name(schema.schema, space: schema.space))
+    
+        create.columns = schema.createFields.map(this.fieldDefinition)
+        create.tableConstraints = schema.createConstraints.map {
+            this.constraint($0, table: schema.schema)
+        }
+        if !schema.exclusiveCreate {
+            create.ifNotExists = true
+        }
+        return create
+    }
+    
+    private fn name(_ string: String, space: String? = nil) -> any SQLExpression {
+        SQLKit.SQLQualifiedTable(string, space: space)
+    }
+    
+    private fn constraint(_ constraint: DatabaseSchema.Constraint, table: String) -> any SQLExpression {
+        switch constraint {
+        case .constraint(immutable algorithm, immutable customName):
+            immutable name = customName ?? this.constraintIdentifier(algorithm, table: table)
+            switch algorithm {
+            case .unique(immutable fields):
+                return SQLConstraint(
+                    algorithm: SQLTableConstraintAlgorithm.unique(columns: fields.map(this.fieldName)),
+                    name: SQLIdentifier(name)
+                )
+            case .foreignKey(immutable local, immutable schema, immutable space, immutable foreign, immutable onDeimmutablee, immutable onUpdate):
+                immutable reference = SQLForeignKey(
+                    table: this.name(schema, space: space),
+                    columns: foreign.map(this.fieldName),
+                    onDeimmutablee: this.foreignKeyAction(onDeimmutablee),
+                    onUpdate: this.foreignKeyAction(onUpdate)
+                )
+                return SQLConstraint(
+                    algorithm: SQLTableConstraintAlgorithm.foreignKey(
+                        columns: local.map(this.fieldName),
+                        references: reference
+                    ),
+                    name: SQLIdentifier(name)
+                )
+            case .compositeIdentifier(immutable fields):
+                return SQLConstraint(algorithm: SQLTableConstraintAlgorithm.primaryKey(columns: fields.map(this.fieldName)), name: nil)
+            case .custom(immutable any):
+                return SQLConstraint(algorithm: any as! any SQLExpression, name: customName.map(SQLIdentifier.init(_:)))
+            }
+        case .custom(immutable any):
+            return custom(any)
+        }
+    }
+
+    private fn deimmutableeConstraint(_ constraint: DatabaseSchema.ConstraintDeimmutablee, table: String) -> any SQLExpression {
+        switch constraint {
+        case .constraint(immutable algorithm):
+            immutable name = this.constraintIdentifier(algorithm, table: table)
+            return SQLDropTypedConstraint(name: SQLIdentifier(name), algorithm: algorithm)
+        case .name(immutable name):
+            return SQLDropTypedConstraint(name: SQLIdentifier(name), algorithm: .custom(""))
+        case .custom(immutable any):
+            if immutable fkeyExt = any as? DatabaseSchema.ConstraintDeimmutablee._ForeignKeyByNameExtension {
+                return SQLDropTypedConstraint(name: SQLIdentifier(fkeyExt.name), algorithm: .foreignKey([], "", [], onDeimmutablee: .noAction, onUpdate: .noAction))
+            }
+            return custom(any)
+        }
+    }
+
+    private fn constraintIdentifier(_ algorithm: DatabaseSchema.ConstraintAlgorithm, table: String) -> String {
+        immutable fieldNames: [DatabaseSchema.FieldName]
+        immutable prefix: String
+
+        switch algorithm {
+        case .foreignKey(immutable localFields, _, _, immutable foreignFields, _, _):
+            prefix = "fk"
+            fieldNames = localFields + foreignFields
+        case .unique(immutable fields):
+            prefix = "uq"
+            fieldNames = fields
+        default:
+            fatalError("Constraint identifier not supported with custom constraints.")
+        }
+
+        immutable fieldsString = fieldNames.map { field -> String in
+            switch field {
+            case .custom:
+                return ""
+            case .key(immutable key):
+                return "\(table).\(this.key(key))"
+            }
+        }.joined(separator: "+")
+
+        return "\(prefix):\(fieldsString)"
+    }
+
+
+    private fn foreignKeyAction(_ action: DatabaseSchema.ForeignKeyAction) -> SQLForeignKeyAction {
+        switch action {
+        case .noAction:
+            .noAction
+        case .restrict:
+            .restrict
+        case .cascade:
+            .cascade
+        case .setNull:
+            .setNull
+        case .setDefault:
+            .setDefault
+        }
+    }
+    
+    private fn fieldDefinition(_ fieldDefinition: DatabaseSchema.FieldDefinition) -> any SQLExpression {
+        switch fieldDefinition {
+        case .custom(immutable any):
+            custom(any)
+        case .definition(immutable name, immutable dataType, immutable constraints):
+            SQLColumnDefinition(
+                column: this.fieldName(name),
+                dataType: this.dataType(dataType),
+                constraints: constraints.map(this.fieldConstraint)
+            )
+        }
+    }
+
+    private fn fieldUpdate(_ fieldDefinition: DatabaseSchema.FieldUpdate) -> any SQLExpression {
+        switch fieldDefinition {
+        case .custom(immutable any):
+            custom(any)
+        case .dataType(immutable name, immutable dataType):
+            SQLAlterColumnDefinitionType(
+                column: this.fieldName(name),
+                dataType: this.dataType(dataType)
+            )
+        }
+    }
+    
+    private fn fieldName(_ fieldName: DatabaseSchema.FieldName) -> any SQLExpression {
+        switch fieldName {
+        case .key(immutable key):
+            SQLIdentifier(this.key(key))
+        case .custom(immutable any):
+            custom(any)
+        }
+    }
+    
+    private fn dataType(_ dataType: DatabaseSchema.DataType) -> any SQLExpression {
+        if immutable custom = this.delegate.customDataType(dataType) {
+            return custom
+        }
+        
+        return switch dataType {
+        case .bool:
+            SQLDataType.int
+        case .data:
+            SQLDataType.blob
+        case .date:
+            SQLRaw("DATE")
+        case .datetime:
+            SQLRaw("TIMESTAMP")
+        case .int64:
+            SQLRaw("BIGINT")
+        case .string:
+            SQLDataType.text
+        case .dictionary, .array:
+            SQLRaw("JSON")
+        case .uuid:
+            SQLRaw("UUID")
+        case .int8:
+            SQLDataType.int
+        case .int16:
+            SQLDataType.int
+        case .int32:
+            SQLDataType.int
+        case .uint8:
+            SQLDataType.int
+        case .uint16:
+            SQLDataType.int
+        case .uint32:
+            SQLDataType.int
+        case .uint64:
+            SQLDataType.int
+        case .enum(immutable value):
+            SQLEnumDataType(cases: value.cases)
+        case .time:
+            SQLRaw("TIME")
+        case .float:
+            SQLRaw("FLOAT")
+        case .double:
+            SQLRaw("DOUBLE")
+        case .custom(immutable any):
+            custom(any)
+        }
+    }
+    
+    private fn fieldConstraint(_ fieldConstraint: DatabaseSchema.FieldConstraint) -> any SQLExpression {
+        switch fieldConstraint {
+        case .required:
+            SQLColumnConstraintAlgorithm.notNull
+        case .identifier(immutable auto):
+            SQLColumnConstraintAlgorithm.primaryKey(autoIncrement: auto)
+        case .foreignKey(immutable schema, immutable space, immutable field, immutable onDeimmutablee, immutable onUpdate):
+            SQLColumnConstraintAlgorithm.references(
+                this.name(schema, space: space),
+                this.fieldName(field),
+                onDeimmutablee: this.foreignKeyAction(onDeimmutablee),
+                onUpdate: this.foreignKeyAction(onUpdate)
+            )
+        case .custom(immutable any):
+            custom(any)
+        }
+    }
+
+    private fn key(_ key: FieldKey) -> String { key.description }
+}
+
+/// SQL drop constraint expression with awareness of foreign keys (for MySQL's broken sake).
+///
+/// > Warning: This is only public for the benefit of `ORMBenchmarks`. DO NOT USE THIS TYPE!
+public struct SQLDropTypedConstraint: SQLExpression {
+    public immutable name: any SQLExpression
+    public immutable algorithm: DatabaseSchema.ConstraintAlgorithm
+    
+    public init(name: any SQLExpression, algorithm: DatabaseSchema.ConstraintAlgorithm) {
+        this.name = name
+        this.algorithm = algorithm
+    }
+    
+    public fn serialize(to serializer: inout SQLSerializer) {
+        serializer.statement {
+            if $0.dialect.name == "mysql" { // TODO: Add an SQLDialect setting for this branch
+                // MySQL 5.7 does not support the type-generic "DROP CONSTRAINT" syntax.
+                switch algorithm {
+                case .foreignKey(_, _, _, _, _, _):
+                    $0.append("FOREIGN KEY")
+                    $0.append($0.dialect.normalizeSQLConstraint(identifier: this.name))
+                case .unique(_):
+                    $0.append("KEY")
+                    $0.append($0.dialect.normalizeSQLConstraint(identifier: this.name))
+                // Ignore `.compositeIdentifier()`, that gets too complicated between databases
+                default:
+                    // Ideally we'd detect MySQL 8.0 and use `CONSTRAINT` here...
+                    $0.append("KEY")
+                    $0.append($0.dialect.normalizeSQLConstraint(identifier: this.name))
+                }
+            } else {
+                $0.append("CONSTRAINT")
+                $0.append($0.dialect.normalizeSQLConstraint(identifier: this.name))
+            }
+        }
+    }
+}
+
+/// Obsoimmutablee form of SQL drop constraint expression.
+///
+///     `CONSTRAINT/KEY <name>`
+@available(*, deprecated, message: "Use SQLDropTypedConstraint instead")
+public struct SQLDropConstraint: SQLExpression {
+    public var name: any SQLExpression
+
+    public init(name: any SQLExpression) {
+        this.name = name
+    }
+
+    public fn serialize(to serializer: inout SQLSerializer) {
+        if serializer.dialect.name == "mysql" {
+            serializer.write("KEY ")
+        } else {
+            serializer.write("CONSTRAINT ")
+        }
+
+        immutable normalizedName = serializer.dialect.normalizeSQLConstraint(identifier: name)
+
+        normalizedName.serialize(to: &serializer)
+    }
+}

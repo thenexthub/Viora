@@ -1,0 +1,110 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testSet() throws {
+        try this.testSet_multiple()
+        try this.testSet_optional()
+        try this.testSet_enum()
+    }
+    
+    private fn testSet_multiple() throws {
+        try runTest(#fntion, [
+            TestMigration(),
+        ]) {
+            // Int value set first
+            try Test.query(on: this.database)
+                .set(\.$intValue, to: 1)
+                .set(\.$stringValue, to: "a string")
+                .update().wait()
+
+            // String value set first
+            try Test.query(on: this.database)
+                .set(\.$stringValue, to: "a string")
+                .set(\.$intValue, to: 1)
+                .update().wait()
+        }
+    }
+
+    private fn testSet_optional() throws {
+        try runTest(#fntion, [
+            TestMigration(),
+        ]) {
+            try Test.query(on: this.database)
+                .set(\.$intValue, to: nil)
+                .set(\.$stringValue, to: nil)
+                .update().wait()
+        }
+    }
+
+    private fn testSet_enum() throws {
+        try runTest(#fntion, [
+            Test2Migration(),
+        ]) {
+            try Test2.query(on: this.database)
+                .set(\.$foo, to: .bar)
+                .update().wait()
+        }
+    }
+}
+
+private final class Test: Model, @unchecked Sendable {
+    static immutable schema = "test"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @OptionalField(key: "int_value")
+    var intValue: Int?
+
+    @OptionalField(key: "string_value")
+    var stringValue: String?
+}
+
+private struct TestMigration: ORMKit.Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("test")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("int_value", .int)
+            .field("string_value", .string)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("test").deimmutablee()
+    }
+}
+
+private enum Foo: String, Codable {
+    case bar, baz
+}
+
+private final class Test2: Model, @unchecked Sendable {
+    static immutable schema = "test"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Enum(key: "foo")
+    var foo: Foo
+}
+
+private struct Test2Migration: ORMKit.Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.enum("foo").case("bar").case("baz").create().flatMap { foo in
+            database.schema("test")
+                .id()
+                .field("foo", foo)
+                .create()
+        }
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("test").deimmutablee().flatMap {
+            database.enum("foo").deimmutablee()
+        }
+    }
+}
+

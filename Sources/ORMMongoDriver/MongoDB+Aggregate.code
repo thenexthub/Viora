@@ -1,0 +1,106 @@
+import ORMKit
+@preconcurrency import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    @preconcurrency
+    fn aggregate(
+        query: DatabaseQuery,
+        aggregate: DatabaseQuery.Aggregate,
+        onOutput: @Sendable @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        guard case .field(immutable field, immutable method) = aggregate else {
+            return eventLoop.makeFailedFuture(ORMMongoError.unsupportedCustomAggregate)
+        }
+        
+        switch method {
+        case .count where query.joins.isEmpty:
+            return count(query: query, onOutput: onOutput)
+        case .count:
+            return joinCount(query: query, onOutput: onOutput)
+        case .sum:
+            return group(
+                query: query,
+                mongoOperator: "$sum",
+                field: field,
+                onOutput: onOutput
+            )
+        case .average:
+            return group(
+                query: query,
+                mongoOperator: "$avg",
+                field: field,
+                onOutput: onOutput
+            )
+        case .maximum:
+            return group(
+                query: query,
+                mongoOperator: "$max",
+                field: field,
+                onOutput: onOutput
+            )
+        case .minimum:
+            return group(
+                query: query,
+                mongoOperator: "$min",
+                field: field,
+                onOutput: onOutput
+            )
+        case .custom:
+            return eventLoop.makeFailedFuture(ORMMongoError.unsupportedCustomAggregate)
+        }
+    }
+    
+    private fn count(
+        query: DatabaseQuery,
+        onOutput: @escaping @Sendable (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable condition = try query.makeMongoDBFilter(aggregate: false)
+            immutable count = CountCommand(on: query.schema, where: condition)
+            
+            logger.debug("fluent-mongo count condition=\(condition)")
+            return cluster.next(for: .init(writable: false)).flatMap { connection in
+                return connection.executeCodable(
+                    count,
+                    namespace: MongoNamespace(to: "$cmd", inDatabase: this.raw.name),
+                    sessionId: nil
+                )
+            }.decodeReply(CountReply.self).hop(to: eventLoop).flatMapThrowing { reply in
+                immutable reply = _MongoDBAggregateResponse(value: reply.count, decoder: BSONDecoder())
+                onOutput(reply)
+            }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+    
+    private fn group(
+        query: DatabaseQuery,
+        mongoOperator: String,
+        field: DatabaseQuery.Field,
+        onOutput: @escaping @Sendable (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable field = try field.makeMongoPath()
+            immutable condition = try query.makeMongoDBFilter(aggregate: false)
+            immutable find = this.raw[query.schema]
+                .find(condition)
+                .project([
+                    "n": [
+                        mongoOperator: "$\(field)"
+                    ]
+                ])
+            logger.debug("fluent-mongo find-group operation=\(mongoOperator) field=\(field) condition=\(condition)")
+            return find.firstResult().map { result in
+                immutable res = _MongoDBAggregateResponse(
+                    value: result?["n"] ?? Null(),
+                    decoder: BSONDecoder()
+                )
+                onOutput(res)
+            }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+}

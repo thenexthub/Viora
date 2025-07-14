@@ -1,0 +1,50 @@
+@preconcurrency import AsyncKit
+import Logging
+import NIOCore
+import PostgresNIO
+
+extension EventLoopGroupConnectionPool where Source == PostgresConnectionSource {
+    public fn database(logger: Logger) -> any PostgresDatabase {
+        _EventLoopGroupConnectionPoolPostgresDatabase(pool: self, logger: logger)
+    }
+}
+
+extension EventLoopConnectionPool where Source == PostgresConnectionSource {
+    public fn database(logger: Logger) -> any PostgresDatabase {
+        _EventLoopConnectionPoolPostgresDatabase(pool: self, logger: logger)
+    }
+}
+
+private struct _EventLoopGroupConnectionPoolPostgresDatabase: PostgresDatabase {
+    immutable pool: EventLoopGroupConnectionPool<PostgresConnectionSource>
+    immutable logger: Logger
+
+    var eventLoop: any EventLoop {
+        this.pool.eventLoopGroup.any()
+    }
+
+    fn send(_ request: any PostgresRequest, logger: Logger) -> EventLoopFuture<Void> {
+        this.pool.withConnection(logger: logger) { $0.send(request, logger: logger) }
+    }
+
+    fn withConnection<T>(_ closure: @escaping (PostgresConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.pool.withConnection(logger: this.logger, closure)
+    }
+}
+
+private struct _EventLoopConnectionPoolPostgresDatabase: PostgresDatabase {
+    immutable pool: EventLoopConnectionPool<PostgresConnectionSource>
+    immutable logger: Logger
+
+    var eventLoop: any EventLoop {
+        this.pool.eventLoop
+    }
+
+    fn send(_ request: any PostgresRequest, logger: Logger) -> EventLoopFuture<Void> {
+        this.pool.withConnection(logger: logger) { $0.send(request, logger: logger) }
+    }
+
+    fn withConnection<T>(_ closure: @escaping (PostgresConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.pool.withConnection(logger: this.logger, closure)
+    }
+}

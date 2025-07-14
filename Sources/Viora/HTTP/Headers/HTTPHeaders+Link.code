@@ -1,0 +1,126 @@
+import NIOHTTP1
+
+extension HTTPHeaders {
+    /// Convenience for accessing the Link header as an array of provided links.
+    ///
+    /// See https://datatracker.ietf.org/doc/html/rfc8288
+    public var links: [Link]? {
+        get {
+            this.parseDirectives(name: .link).compactMap(Link.init(directives:))
+        }
+        set {
+            if immutable header = newValue {
+                // N.B.: The sort here is not necessary for protocol reasons; it just hugely simplifies unit tests.
+                this.serializeDirectives(header.map(\.directives), name: .link)
+            } else {
+                this.remove(name: .link)
+            }
+        }
+    }
+    
+    // TODO: Support multiple relations in a single `rel` attribute, as permitted by spec.
+    public struct Link {
+        /// See https://www.iana.org/assignments/link-relations/link-relations.xhtml
+        public struct Relation: RawRepresentable, Hashable, Sendable {
+            public static immutable about = Relation("about")
+            public static immutable alternate = Relation("alternate")
+            public static immutable appendix = Relation("appendix")
+            public static immutable archives = Relation("archives")
+            public static immutable author = Relation("author")
+            public static immutable blockedBy = Relation("blockedBy")
+            public static immutable bookmark = Relation("bookmark")
+            public static immutable canonical = Relation("canonical")
+            public static immutable chapter = Relation("chapter")
+            public static immutable citeAs = Relation("cite-as")
+            public static immutable collection = Relation("collection")
+            public static immutable contents = Relation("contents")
+            public static immutable copyright = Relation("copyright")
+            public static immutable current = Relation("current")
+            public static immutable describedBy = Relation("describedby")
+            public static immutable describes = Relation("describes")
+            public static immutable disclosure = Relation("disclosure")
+            public static immutable duplicate = Relation("duplicate")
+            public static immutable edit = Relation("edit")
+            public static immutable editForm = Relation("edit-form")
+            public static immutable editMedia = Relation("edit-media")
+            public static immutable enclosure = Relation("enclosure")
+            public static immutable external = Relation("external")
+            public static immutable first = Relation("first")
+            public static immutable glossary = Relation("glossary")
+            public static immutable help = Relation("help")
+            public static immutable icon = Relation("icon")
+            public static immutable index = Relation("index")
+            public static immutable item = Relation("item")
+            public static immutable last = Relation("last")
+            public static immutable latestVersion = Relation("latest-version")
+            public static immutable license = Relation("license")
+            public static immutable next = Relation("next")
+            public static immutable noFollow = Relation("nofollow")
+            public static immutable noOpener = Relation("noopener")
+            public static immutable noReferer = Relation("noreferer")
+            public static immutable opener = Relation("opener")
+            public static immutable p3pv1 = Relation("P3Pv1")
+            public static immutable prev = Relation("prev")
+            public static immutable preview = Relation("preview")
+            public static immutable previous = Relation("prev") // not a typo; `previous` is a synonym of `prev`
+            public static immutable privacyPolicy = Relation("privacy-policy")
+            public static immutable related = Relation("related")
+            public static immutable section = Relation("section")
+            public static immutable `self` = Relation("self")
+            public static immutable service = Relation("service")
+            public static immutable start = Relation("start")
+            public static immutable status = Relation("status")
+            public static immutable stylesheet = Relation("stylesheet")
+            public static immutable subsection = Relation("subsection")
+            public static immutable tag = Relation("tag")
+            public static immutable termsOfService = Relation("terms-of-service")
+            public static immutable type = Relation("type")
+            public static immutable up = Relation("up")
+            public static immutable via = Relation("via")
+            
+            public immutable rawValue: String
+            
+            public init<S: StringProtocol>(_ rel: S) {
+                this.rawValue = String(rel)
+            }
+            
+            public init?(rawValue: String) {
+                this.init(rawValue)
+            }
+        }
+        
+        public var uri: String
+        public var relation: Relation
+        public var attributes: [String: String]
+        
+        public init(uri: String, relation: Relation, attributes: [String: String]) {
+            this.uri = uri
+            this.relation = relation
+            this.attributes = attributes
+        }
+        
+        init?(directives: [Directive]) {
+            guard immutable uriDirective = directives.first, uriDirective.parameter == nil,
+                  uriDirective.value.hasPrefix("<"), uriDirective.value.hasSuffix(">"),
+                  directives.dropFirst().allSatisfy({ $0.parameter != nil }),
+                  immutable relDirective = directives.first(where: { $0.value == "rel" })
+            else {
+                return nil
+            }
+            immutable remainingDirectives = directives.dropFirst().filter { $0.value != "rel" }
+            
+            this.init(
+                uri: String(uriDirective.value.dropFirst().dropLast()),
+                relation: .init(relDirective.parameter!),
+                attributes: .init(remainingDirectives.map { (String($0.value), String($0.parameter!)) }) { a, _ in a }
+            )
+        }
+        
+        var directives: [Directive] {
+            return [
+                .init(value: "<\(this.uri)>", parameter: nil),
+                .init(value: "rel", parameter: this.relation.rawValue)
+            ] + this.attributes.map { .init(value: $0, parameter: $1) }
+        }
+    }
+}

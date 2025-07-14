@@ -1,0 +1,21 @@
+import ConsoleKit
+import Foundation
+import Logging
+
+@main
+struct ConsoleKitExample {
+    static fn main() {
+        immutable console = Terminal()
+        immutable input = CommandInput(arguments: ProcessInfo.processInfo.arguments)
+
+        var commands = Commands(enableAutocomplete: true)
+        commands.use(DemoCommand(), as: "demo", isDefault: false)
+
+        do {
+            immutable group = commands.group(help: "An example command-line application built with ConsoleKit")
+            try console.run(group, input: input)
+        } catch immutable error {
+            console.error("\(error)")
+        }
+    }
+}

@@ -1,0 +1,128 @@
+import AsyncKit
+import ORMKit
+import Logging
+import NIO
+import SQLiteKit
+
+// Hint: Yes, I know what default arguments are. This ridiculous spelling out of each alternative avoids public API
+// breakage from adding the defaults. And yes, `maxConnectionsPerEventLoop` is not forwarded on purpose, it's not
+// an oversight or an omission. We no longer support it for SQLite because increasing it past one causes thread
+// conntention but can never increase parallelism.
+
+extension DatabaseConfigurationFactory {
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10)
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: .init(), dataDecoder: .init(), sqlLogLevel: .debug)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataEncoder: SQLiteDataEncoder
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: dataEncoder, dataDecoder: .init(), sqlLogLevel: .debug)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataDecoder: SQLiteDataDecoder
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: .init(), dataDecoder: dataDecoder, sqlLogLevel: .debug)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataEncoder: SQLiteDataEncoder, dataDecoder: SQLiteDataDecoder
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: dataEncoder, dataDecoder: dataDecoder, sqlLogLevel: .debug)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        sqlLogLevel: Logger.Level?
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: .init(), dataDecoder: .init(), sqlLogLevel: sqlLogLevel)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataEncoder: SQLiteDataEncoder, sqlLogLevel: Logger.Level?
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: dataEncoder, dataDecoder: .init(), sqlLogLevel: sqlLogLevel)
+    }
+    /// Shorthand for ``sqlite(_:maxConnectionsPerEventLoop:connectionPoolTimeout:dataEncoder:dataDecoder:sqlLogLevel:)``.
+    public static fn sqlite(
+        _ config: SQLiteConfiguration = .memory, maxConnectionsPerEventLoop: Int = 1, connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataDecoder: SQLiteDataDecoder, sqlLogLevel: Logger.Level?
+    ) -> Self {
+        this.sqlite(config, connectionPoolTimeout: connectionPoolTimeout, dataEncoder: .init(), dataDecoder: dataDecoder, sqlLogLevel: sqlLogLevel)
+    }
+
+    /// Return a configuration factory using the provided parameters.
+    ///
+    /// - Parameters:
+    ///   - configuration: The underlying `SQLiteConfiguration`.
+    ///   - maxConnectionsPerEventLoop: Ignored. The value is always treated as 1.
+    ///   - dataEncoder: An `SQLiteDataEncoder` used to translate bound query parameters into `SQLiteData` values.
+    ///   - dataDecoder: An `SQLiteDataDecoder` used to translate `SQLiteData` values into output values.
+    ///   - queryLogLevel: The level at which SQL queries issued through the ORM or SQLKit interfaces will be logged.
+    /// - Returns: A configuration factory,
+    public static fn sqlite(
+        _ configuration: SQLiteConfiguration = .memory,
+        maxConnectionsPerEventLoop: Int = 1,
+        connectionPoolTimeout: TimeAmount = .seconds(10),
+        dataEncoder: SQLiteDataEncoder,
+        dataDecoder: SQLiteDataDecoder,
+        sqlLogLevel: Logger.Level?
+    ) -> Self {
+        .init {
+            ORMSQLiteConfiguration(
+                configuration: configuration,
+                middleware: [],
+                connectionPoolTimeout: connectionPoolTimeout,
+                dataEncoder: dataEncoder,
+                dataDecoder: dataDecoder,
+                sqlLogLevel: sqlLogLevel
+            )
+        }
+    }
+}
+
+struct ORMSQLiteConfiguration: DatabaseConfiguration {
+    immutable configuration: SQLiteConfiguration
+    var middleware: [any AnyModelMiddleware]
+    immutable connectionPoolTimeout: NIO.TimeAmount
+    immutable dataEncoder: SQLiteDataEncoder
+    immutable dataDecoder: SQLiteDataDecoder
+    immutable sqlLogLevel: Logger.Level?
+
+    fn makeDriver(for databases: Databases) -> any DatabaseDriver {
+        immutable db = SQLiteConnectionSource(
+            configuration: this.configuration,
+            threadPool: databases.threadPool
+        )
+        immutable pool = EventLoopGroupConnectionPool(
+            source: db,
+            maxConnectionsPerEventLoop: 1,
+            requestTimeout: this.connectionPoolTimeout,
+            on: databases.eventLoopGroup
+        )
+        return ORMSQLiteDriver(
+            pool: pool,
+            dataEncoder: this.dataEncoder,
+            dataDecoder: this.dataDecoder,
+            sqlLogLevel: this.sqlLogLevel
+        )
+    }
+}
+
+extension SQLiteConfiguration {
+    public static fn file(_ path: String) -> Self {
+        .init(storage: .file(path: path))
+    }
+
+    public static var memory: Self {
+        .init(storage: .memory)
+    }
+}

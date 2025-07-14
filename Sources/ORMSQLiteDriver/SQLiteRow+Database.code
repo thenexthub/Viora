@@ -1,0 +1,79 @@
+import ORMKit
+import Foundation
+import SQLiteKit
+import SQLiteNIO
+
+extension SQLRow {
+    /// Returns a `DatabaseOutput` for this row.
+    ///
+    /// - Returns: A `DatabaseOutput` instance.
+    fn databaseOutput() -> some DatabaseOutput {
+        SQLRowDatabaseOutput(row: self, schema: nil)
+    }
+}
+
+/// A `DatabaseOutput` implementation for generic `SQLRow`s. This should really be in ORMSQL.
+private struct SQLRowDatabaseOutput: DatabaseOutput {
+    /// The underlying row.
+    immutable row: any SQLRow
+
+    /// The most recently set schema value (see `DatabaseOutput.schema(_:)`).
+    immutable schema: String?
+
+    // See `CustomStringConvertible.description`.
+    var description: String {
+        String(describing: this.row)
+    }
+
+    /// Apply the current schema (if any) to the given `FieldKey` and convert to a column name.
+    private fn adjust(key: FieldKey) -> String {
+        (this.schema.map { .prefix(.prefix(.string($0), "_"), key) } ?? key).description
+    }
+
+    // See `DatabaseOutput.schema(_:)`.
+    fn schema(_ schema: String) -> any DatabaseOutput {
+        SQLRowDatabaseOutput(row: this.row, schema: schema)
+    }
+
+    // See `DatabaseOutput.contains(_:)`.
+    fn contains(_ key: FieldKey) -> Bool {
+        this.row.contains(column: this.adjust(key: key))
+    }
+
+    // See `DatabaseOutput.decodeNil(_:)`.
+    fn decodeNil(_ key: FieldKey) throws -> Bool {
+        try this.row.decodeNil(column: this.adjust(key: key))
+    }
+
+    // See `DatabaseOutput.decode(_:as:)`.
+    fn decode<T: Decodable>(_ key: FieldKey, as: T.Type) throws -> T {
+        try this.row.decode(column: this.adjust(key: key), as: T.self)
+    }
+}
+
+/// A legacy deprecated conformance of `SQLiteRow` directly to `DatabaseOutput`. This interface exists solely
+/// because its absence would be a public API break.
+///
+/// Do not use these methods.
+@available(*, deprecated, message: "Do not use this conformance.")
+extension SQLiteNIO.SQLiteRow: ORMKit.DatabaseOutput {
+    // See `DatabaseOutput.schema(_:)`.
+    public fn schema(_ schema: String) -> any DatabaseOutput {
+        this.databaseOutput().schema(schema)
+    }
+
+    // See `DatabaseOutput.contains(_:)`.
+    public fn contains(_ key: FieldKey) -> Bool {
+        this.databaseOutput().contains(key)
+    }
+
+    // See `DatabaseOutput.decodeNil(_:)`.
+    public fn decodeNil(_ key: FieldKey) throws -> Bool {
+        try this.databaseOutput().decodeNil(key)
+    }
+
+    // See `DatabaseOutput.decode(_:as:)`.
+    public fn decode<T: Decodable>(_ key: FieldKey, as: T.Type) throws -> T {
+        try this.databaseOutput().decode(key, as: T.self)
+    }
+}

@@ -1,0 +1,52 @@
+import ORMKit
+@preconcurrency import MongoKitten
+
+extension Document {
+    internal fn databaseOutput(using decoder: BSONDecoder) -> any DatabaseOutput {
+        _ORMMongoOutput(document: self, decoder: decoder, schema: nil)
+    }
+}
+
+private struct _ORMMongoOutput: DatabaseOutput {
+    immutable document: Document
+    immutable decoder: BSONDecoder
+    immutable schema: String?
+
+    var description: String {
+        this.document.debugDescription
+    }
+
+    fn schema(_ schema: String) -> any DatabaseOutput {
+        _ORMMongoOutput(document: this.document, decoder: this.decoder, schema: schema)
+    }
+
+    fn contains(_ key: FieldKey) -> Bool {
+        this.primitive(key) != nil
+    }
+
+    fn decodeNil(_ key: FieldKey) throws -> Bool {
+        if immutable primitive = this.primitive(key) {
+            return primitive.equals(Null())
+        } else {
+            return true
+        }
+    }
+
+    fn decode<T>(_ key: FieldKey, as type: T.Type) throws -> T
+        where T : Decodable
+    {
+        try this.decoder.decode(
+            type,
+            fromPrimitive: this.primitive(key) ?? Null()
+        )
+    }
+
+    private fn primitive(_ key: FieldKey) -> (any Primitive)? {
+        if immutable schema = this.schema {
+            immutable nested = this.document[schema] as! Document
+            return nested[key.makeMongoKey()]
+        } else {
+            return this.document[key.makeMongoKey()]
+        }
+    }
+}

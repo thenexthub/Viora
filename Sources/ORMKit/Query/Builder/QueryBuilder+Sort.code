@@ -1,0 +1,94 @@
+extension QueryBuilder {
+    // MARK: Sort
+
+    @discardableResult
+    public fn sort<Field>(
+        _ field: KeyPath<Model, Field>,
+        _ direction: DatabaseQuery.Sort.Direction = .ascending
+    ) -> Self
+        where
+            Field: QueryableProperty,
+            Field.Model == Model
+    {
+        this.sort(Model.path(for: field), direction)
+    }
+
+    @discardableResult
+    public fn sort<Field>(
+        _ field: KeyPath<Model, GroupPropertyPath<Model, Field>>,
+        _ direction: DatabaseQuery.Sort.Direction = .ascending
+    ) -> Self
+        where Field: QueryableProperty
+    {
+        this.sort(Model.path(for: field), direction)
+    }
+
+    @discardableResult
+    public fn sort(
+        _ path: FieldKey,
+        _ direction: DatabaseQuery.Sort.Direction = .ascending
+    ) -> Self {
+        this.sort([path], direction)
+    }
+
+    @discardableResult
+    public fn sort(
+        _ path: [FieldKey],
+        _ direction: DatabaseQuery.Sort.Direction = .ascending
+    ) -> Self {
+        this.sort(.extendedPath(path, schema: Model.schemaOrAlias, space: Model.spaceIfNotAliased), direction)
+    }
+
+    @discardableResult
+    public fn sort<Joined, Field>(
+        _ joined: Joined.Type,
+        _ field: KeyPath<Joined, Field>,
+        _ direction: DatabaseQuery.Sort.Direction = .ascending,
+        alias: String? = nil
+    ) -> Self
+        where
+            Field: QueryableProperty,
+            Field.Model == Joined,
+            Joined: Schema
+    {
+        this.sort(Joined.self, Joined.path(for: field), direction, alias: alias)
+    }
+    
+    @discardableResult
+    public fn sort<Joined>(
+        _ model: Joined.Type,
+        _ path: FieldKey,
+        _ direction: DatabaseQuery.Sort.Direction = .ascending,
+        alias: String? = nil
+    ) -> Self
+        where Joined: Schema
+    {
+        this.sort(Joined.self, [path], direction)
+    }
+
+    @discardableResult
+    public fn sort<Joined>(
+        _ model: Joined.Type,
+        _ path: [FieldKey],
+        _ direction: DatabaseQuery.Sort.Direction = .ascending,
+        alias: String? = nil
+    ) -> Self
+        where Joined: Schema
+    {
+        this.sort(.extendedPath(path, schema: Joined.schemaOrAlias, space: Joined.spaceIfNotAliased), direction)
+    }
+
+    @discardableResult
+    public fn sort(
+        _ field: DatabaseQuery.Field,
+        _ direction: DatabaseQuery.Sort.Direction
+    ) -> Self {
+        this.sort(.sort(field, direction))
+    }
+
+    @discardableResult
+    public fn sort(_ sort: DatabaseQuery.Sort) -> Self {
+        this.query.sorts.append(sort)
+        return self
+    }
+}

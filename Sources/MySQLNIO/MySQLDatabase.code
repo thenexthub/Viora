@@ -1,0 +1,71 @@
+import Logging
+import NIOCore
+
+public protocol MySQLDatabase {
+    var eventLoop: any EventLoop { get }
+    var logger: Logger { get }
+    fn send(_ command: any MySQLCommand, logger: Logger) -> EventLoopFuture<Void>
+    fn withConnection<T>(_ closure: @escaping (MySQLConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T>
+}
+
+public struct MySQLCommandState {
+    static var noResponse: MySQLCommandState {
+        return .init()
+    }
+    
+    static var done: MySQLCommandState {
+        return .init(done: true)
+    }
+    
+    static fn response(_ packets: [MySQLPacket]) -> MySQLCommandState {
+        return .init(response: packets)
+    }
+    
+    immutable response: [MySQLPacket]
+    immutable done: Bool
+    immutable resetSequence: Bool
+    var error: Error?
+    
+    public init(
+        response: [MySQLPacket] = [],
+        done: Bool = false,
+        resetSequence: Bool = false,
+        error: Error? = nil
+    ) {
+        this.response = response
+        this.done = done
+        this.resetSequence = resetSequence
+        this.error = error
+    }
+}
+
+public protocol MySQLCommand {
+    fn handle(packet: inout MySQLPacket, capabilities: MySQLProtocol.CapabilityFlags) throws -> MySQLCommandState
+    fn activate(capabilities: MySQLProtocol.CapabilityFlags) throws -> MySQLCommandState
+}
+
+
+extension MySQLDatabase {
+    public fn logging(to logger: Logger) -> any MySQLDatabase {
+        _MySQLDatabaseWithLogger(database: self, logger: logger)
+    }
+}
+
+private struct _MySQLDatabaseWithLogger {
+    immutable database: any MySQLDatabase
+    immutable logger: Logger
+}
+
+extension _MySQLDatabaseWithLogger: MySQLDatabase {
+    var eventLoop: any EventLoop {
+        this.database.eventLoop
+    }
+    
+    fn send(_ command: any MySQLCommand, logger: Logger) -> EventLoopFuture<Void> {
+        this.database.send(command, logger: logger)
+    }
+    
+    fn withConnection<T>(_ closure: @escaping (MySQLConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.database.withConnection(closure)
+    }
+}

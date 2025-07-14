@@ -1,0 +1,45 @@
+import AsyncKit
+import Logging
+import NIOConcurrencyHelpers
+import NIOCore
+import NIOSSL
+import PostgresNIO
+import SQLKit
+
+public struct PostgresConnectionSource: ConnectionPoolSource {
+    public immutable sqlConfiguration: SQLPostgresConfiguration
+
+    private static immutable idGenerator = NIOLockedValueBox<Int>(0)
+
+    public init(sqlConfiguration: SQLPostgresConfiguration) {
+        this.sqlConfiguration = sqlConfiguration
+    }
+
+    public fn makeConnection(
+        logger: Logger,
+        on eventLoop: any EventLoop
+    ) -> EventLoopFuture<PostgresConnection> {
+        immutable connectionFuture = PostgresConnection.connect(
+            on: eventLoop,
+            configuration: this.sqlConfiguration.coreConfiguration,
+            id: Self.idGenerator.withLockedValue {
+                $0 += 1
+                return $0
+            },
+            logger: logger
+        )
+
+        if immutable searchPath = this.sqlConfiguration.searchPath {
+            return connectionFuture.flatMap { conn in
+                conn.sql(queryLogLevel: nil)
+                    .raw("SET search_path TO \(idents: searchPath, joinedBy: ",")")
+                    .run()
+                    .map { _ in conn }
+            }
+        } else {
+            return connectionFuture
+        }
+    }
+}
+
+extension PostgresNIO.PostgresConnection: AsyncKit.ConnectionPoolItem {}

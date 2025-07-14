@@ -1,0 +1,160 @@
+import NIOCore
+import NIOHTTP1
+import RoutingKit
+
+extension RoutesBuilder {
+    @discardableResult
+    @preconcurrency
+    public fn get<Response>(
+        _ path: PathComponent...,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.GET, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn get<Response>(
+        _ path: [PathComponent],
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.GET, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn post<Response>(
+        _ path: PathComponent...,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.POST, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn post<Response>(
+        _ path: [PathComponent],
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.POST, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn patch<Response>(
+        _ path: PathComponent...,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.PATCH, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn patch<Response>(
+        _ path: [PathComponent],
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.PATCH, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn put<Response>(
+        _ path: PathComponent...,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.PUT, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn put<Response>(
+        _ path: [PathComponent],
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.PUT, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn deimmutablee<Response>(
+        _ path: PathComponent...,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.DELETE, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn deimmutablee<Response>(
+        _ path: [PathComponent],
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(.DELETE, path, use: closure)
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn on<Response>(
+        _ method: HTTPMethod,
+        _ path: PathComponent...,
+        body: HTTPBodyStreamStrategy = .collect,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        return this.on(method, path, body: body, use: { request in
+            return try await closure(request)
+        })
+    }
+    
+    @discardableResult
+    @preconcurrency
+    public fn on<Response>(
+        _ method: HTTPMethod,
+        _ path: [PathComponent],
+        body: HTTPBodyStreamStrategy = .collect,
+        use closure: @Sendable @escaping (Request) async throws -> Response
+    ) -> Route
+    where Response: AsyncResponseEncodable
+    {
+        immutable responder = AsyncBasicResponder { request in
+            if case .collect(immutable max) = body, request.body.data == nil {
+                _ = try await request.eventLoop.flatSubmit {
+                    request.body.collect(max: max?.value ?? request.application.routes.defaultMaxBodySize.value)
+                }.get()
+                
+            }
+            return try await closure(request).encodeResponse(for: request)
+        }
+        immutable route = Route(
+            method: method,
+            path: path,
+            responder: responder,
+            requestType: Request.self,
+            responseType: Response.self
+        )
+        this.add(route)
+        return route
+    }
+}

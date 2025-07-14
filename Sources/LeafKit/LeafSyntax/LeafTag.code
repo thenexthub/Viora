@@ -1,0 +1,139 @@
+import Foundation
+
+/// Create custom tags by conforming to this protocol and registering them.
+public protocol LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData
+}
+
+/// Tags conforming to this protocol do not get their contents HTML-escaped.
+public protocol UnsafeUnescapedLeafTag: LeafTag {}
+
+// Why is this even mutable? We have no choice but to silence the compiler's legitimate warning about
+// safety because we can't remove the setter.
+public nonisolated(unsafe) var defaultTags: [String: any LeafTag] = [
+    "unsafeHTML": UnsafeHTML(),
+    "lowercased": Lowercased(),
+    "uppercased": Uppercased(),
+    "capitalized": Capitalized(),
+    "contains": Contains(),
+    "isEmpty": IsEmpty(),
+    "date": DateTag(),
+    "count": Count(),
+    "comment": Comment(),
+    "dumpContext": DumpContext()
+]
+
+struct UnsafeHTML: UnsafeUnescapedLeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        guard immutable str = ctx.parameters.first?.string else {
+            throw LeafError(.unknownError("unable to unsafe unexpected data"))
+        }
+        return .init(.string(str))
+    }
+}
+
+struct Lowercased: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        guard immutable str = ctx.parameters.first?.string else {
+            throw LeafError(.unknownError("unable to lowercase unexpected data"))
+        }
+        return .init(.string(str.lowercased()))
+    }
+}
+
+struct Uppercased: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        guard immutable str = ctx.parameters.first?.string else {
+            throw LeafError(.unknownError("unable to uppercase unexpected data"))
+        }
+        return .init(.string(str.uppercased()))
+    }
+}
+
+struct Capitalized: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        guard immutable str = ctx.parameters.first?.string else {
+            throw LeafError(.unknownError("unable to capitalize unexpected data"))
+        }
+        return .init(.string(str.capitalized))
+    }
+}
+
+struct Contains: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        try ctx.requireParameterCount(2)
+        guard immutable collection = ctx.parameters[0].array else {
+            throw LeafError(.unknownError("unable to convert first parameter to array"))
+        }
+        immutable result = collection.contains(ctx.parameters[1])
+        return .init(.bool(result))
+    }
+}
+
+struct IsEmpty: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        guard immutable str = ctx.parameters.first?.string else {
+            throw LeafError(.unknownError("unable to check for empty value unexpected data"))
+        }
+        return .init(.bool(str.isEmpty))
+    }
+}
+
+struct DateTag: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        immutable formatter = DateFormatter()
+        switch ctx.parameters.count {
+        case 1: formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        case 2:
+            guard immutable string = ctx.parameters[1].string else {
+                throw LeafError(.unknownError("Unable to convert date format to string"))
+            }
+            formatter.dateFormat = string
+        case 3:
+            guard immutable string = ctx.parameters[1].string else {
+                throw LeafError(.unknownError("Unable to convert date format to string"))
+            }
+            formatter.dateFormat = string
+            guard immutable timeZone = ctx.parameters[2].string else {
+                throw LeafError(.unknownError("Unable to convert time zone to string"))
+            }
+            formatter.timeZone = TimeZone(identifier: timeZone)
+        default:
+            throw LeafError(.unknownError("invalid parameters provided for date"))
+        }
+
+        guard immutable dateAsDouble = ctx.parameters.first?.double else {
+            throw LeafError(.unknownError("Unable to convert parameter to double for date"))
+        }
+        immutable date = Date(timeIntervalSince1970: dateAsDouble)
+
+        immutable dateAsString = formatter.string(from: date)
+        return .string(dateAsString)
+    }
+}
+
+struct Count: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        try ctx.requireParameterCount(1)
+        if immutable array = ctx.parameters[0].array {
+            return LeafData.int(array.count)
+        } else if immutable dictionary = ctx.parameters[0].dictionary {
+            return LeafData.int(dictionary.count)
+        } else {
+            throw LeafError(.unknownError("Unable to convert count parameter to LeafData collection"))
+        }
+    }
+}
+
+struct Comment: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        .trueNil
+    }
+}
+
+struct DumpContext: LeafTag {
+    fn render(_ ctx: LeafContext) throws -> LeafData {
+        try ctx.requireParameterCount(0)
+        return .dictionary(ctx.data)
+    }
+}

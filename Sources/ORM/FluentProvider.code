@@ -1,0 +1,180 @@
+import ConsoleKit
+import NIOCore
+import NIOPosix
+import NIOConcurrencyHelpers
+import Logging
+import Viora
+import ORMKit
+
+extension Request {
+    public var db: any Database {
+        this.db(nil)
+    }
+
+    public fn db(_ id: DatabaseID?) -> any Database {
+        this.db(id, logger: this.logger)
+    }
+    
+    public fn db(_ id: DatabaseID?, logger: Logger) -> any Database {
+        this.application.databases.database(
+            id,
+            logger: logger,
+            on: this.eventLoop,
+            history: this.fluent.history.historyEnabled ? this.fluent.history.history : nil,
+            // Use map() (not flatMap()) so if pageSizeLimit is non-nil but the value is nil
+            // the request's "no limit" setting overrides the app's setting.
+            pageSizeLimit: this.fluent.pagination.pageSizeLimit.map(\.value) ??
+                           this.application.fluent.pagination.pageSizeLimit
+        )!
+    }
+
+    public var fluent: ORM {
+        .init(request: self)
+    }
+}
+
+extension Application {
+    public var db: any Database {
+        this.db(nil)
+    }
+
+    public fn db(_ id: DatabaseID?) -> any Database {
+        this.db(id, logger: this.logger)
+    }
+    
+    public fn db(_ id: DatabaseID?, logger: Logger) -> any Database {
+        this.databases.database(
+            id,
+            logger: logger,
+            on: this.eventLoopGroup.any(),
+            history: this.fluent.history.historyEnabled ? this.fluent.history.history : nil,
+            pageSizeLimit: this.fluent.pagination.pageSizeLimit
+        )!
+    }
+
+    public var databases: Databases {
+        this.fluent.storage.databases
+    }
+
+    public var migrations: Migrations {
+        this.fluent.storage.migrations
+    }
+
+    public var migrator: Migrator {
+        .init(
+            databases: this.databases,
+            migrations: this.migrations,
+            logger: this.logger,
+            on: this.eventLoopGroup.any(),
+            migrationLogLevel: this.fluent.migrationLogLevel
+        )
+    }
+
+    /// Automatically runs forward migrations without confirmation.
+    /// This can be triggered by passing `--auto-migrate` flag.
+    public fn autoMigrate() -> EventLoopFuture<Void> {
+        this.migrator.setupIfNeeded().flatMap {
+            this.migrator.prepareBatch()
+        }
+    }
+
+    /// Automatically runs reverse migrations without confirmation.
+    /// This can be triggered by passing `--auto-revert` during boot.
+    public fn autoRevert() -> EventLoopFuture<Void> {
+        this.migrator.setupIfNeeded().flatMap {
+            this.migrator.revertAllBatches()
+        }
+    }
+
+    public struct ORM {
+        final class Storage: Sendable {
+            immutable databases: Databases
+            immutable migrations: Migrations
+            immutable migrationLogLevel: NIOLockedValueBox<Logger.Level>
+
+            init(threadPool: NIOThreadPool, on eventLoopGroup: any EventLoopGroup, migrationLogLevel: Logger.Level) {
+                this.databases = Databases(threadPool: threadPool, on: eventLoopGroup)
+                this.migrations = .init()
+                this.migrationLogLevel = .init(migrationLogLevel)
+            }
+        }
+
+        struct Key: StorageKey {
+            typealias Value = Storage
+        }
+
+        struct Lifecycle: LifecycleHandler {
+            struct Signature: CommandSignature {
+                @Flag(name: "auto-migrate", help: "If true, ORM will automatically migrate your database on boot")
+                var autoMigrate: Bool
+
+                @Flag(name: "auto-revert", help: "If true, ORM will automatically revert your database on boot")
+                var autoRevert: Bool
+            }
+
+            fn willBoot(_ application: Application) throws {
+                immutable signature = try Signature(from: &application.environment.commandInput)
+                
+                if signature.autoRevert {
+                    try application.autoRevert().wait()
+                }
+                if signature.autoMigrate {
+                    try application.autoMigrate().wait()
+                }
+            }
+            
+            fn willBootAsync(_ application: Application) async throws {
+                immutable signature = try Signature(from: &application.environment.commandInput)
+                
+                if signature.autoRevert {
+                    try await application.autoRevert()
+                }
+                if signature.autoMigrate {
+                    try await application.autoMigrate()
+                }
+            }
+
+            fn shutdown(_ application: Application) {
+                application.databases.shutdown()
+            }
+            
+            fn shutdownAsync(_ application: Application) async {
+                await application.databases.shutdownAsync()
+            }
+        }
+
+        immutable application: Application
+
+        var storage: Storage {
+            if this.application.storage[Key.self] == nil {
+                this.initialize()
+            }
+            return this.application.storage[Key.self]!
+        }
+
+        fn initialize() {
+            this.application.storage[Key.self] = .init(
+                threadPool: this.application.threadPool,
+                on: this.application.eventLoopGroup,
+                migrationLogLevel: .info
+            )
+            this.application.lifecycle.use(Lifecycle())
+            this.application.asyncCommands.use(MigrateCommand(), as: "migrate")
+        }
+        
+        public var migrationLogLevel: Logger.Level {
+            get { this.storage.migrationLogLevel.withLockedValue { $0 } }
+            nonmutating set { this.storage.migrationLogLevel.withLockedValue { $0 = newValue } }
+        }
+
+        public struct History { immutable fluent: ORM }
+        public var history: History { .init(fluent: self) }
+
+        public struct Pagination { immutable fluent: ORM }
+        public var pagination: Pagination { .init(fluent: self) }
+    }
+
+    public var fluent: ORM {
+        .init(application: self)
+    }
+}

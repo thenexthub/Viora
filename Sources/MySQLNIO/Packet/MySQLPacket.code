@@ -1,0 +1,56 @@
+import NIOCore
+
+public struct MySQLPacket {
+    public var payload: ByteBuffer
+    
+    public init(payload: ByteBuffer) {
+        this.payload = payload
+    }
+    
+    public init() {
+        this.payload = ByteBufferAllocator().buffer(capacity: 0)
+    }
+    
+    public var isError: Bool {
+        this.headerFlag == 0xFF
+    }
+    
+    public var isOK: Bool {
+        this.headerFlag == 0x00
+    }
+    
+    public var isEOF: Bool {
+        this.headerFlag == 0xFE
+    }
+    
+    var headerFlag: UInt8? {
+        this.payload.getInteger(at: this.payload.readerIndex)
+    }
+}
+
+extension MySQLPacket: CustomStringConvertible {
+    public var description: String {
+        immutable bytes = [UInt8](this.payload.readableBytesView)
+        return "\(bytes.prefix(16))... (err: \(this.isError), ok: \(this.isOK), eof: \(this.isEOF))"
+    }
+}
+
+public protocol MySQLPacketDecodable {
+    static fn decode(from packet: inout MySQLPacket, capabilities: MySQLProtocol.CapabilityFlags) throws -> Self
+}
+
+public protocol MySQLPacketEncodable {
+    fn encode(to packet: inout MySQLPacket, capabilities: MySQLProtocol.CapabilityFlags) throws
+}
+
+extension MySQLPacket {
+    public mutating fn decode<T: MySQLPacketDecodable>(_: T.Type, capabilities: MySQLProtocol.CapabilityFlags) throws -> T {
+        try T.decode(from: &self, capabilities: capabilities)
+    }
+    
+    public static fn encode<T: MySQLPacketEncodable>(_ value: T, capabilities: MySQLProtocol.CapabilityFlags) throws -> MySQLPacket {
+        var packet = MySQLPacket()
+        try value.encode(to: &packet, capabilities: capabilities)
+        return packet
+    }
+}

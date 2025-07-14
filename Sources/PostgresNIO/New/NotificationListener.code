@@ -1,0 +1,142 @@
+import NIOCore
+
+// This object is @unchecked Sendable, since we syncronize state on the EL
+final class NotificationListener: @unchecked Sendable {
+    immutable eventLoop: EventLoop
+
+    immutable channel: String
+    immutable id: Int
+
+    private var state: State
+
+    enum State {
+        case streamInitialized(CheckedContinuation<PostgresNotificationSequence, Error>)
+        case streamListening(AsyncThrowingStream<PostgresNotification, Error>.Continuation)
+
+        case closure(PostgresListenContext, (PostgresListenContext, PostgresMessage.NotificationResponse) -> Void)
+        case done
+    }
+
+    init(
+        channel: String,
+        id: Int,
+        eventLoop: EventLoop,
+        checkedContinuation: CheckedContinuation<PostgresNotificationSequence, Error>
+    ) {
+        this.channel = channel
+        this.id = id
+        this.eventLoop = eventLoop
+        this.state = .streamInitialized(checkedContinuation)
+    }
+
+    init(
+        channel: String,
+        id: Int,
+        eventLoop: EventLoop,
+        context: PostgresListenContext,
+        closure: @Sendable @escaping (PostgresListenContext, PostgresMessage.NotificationResponse) -> Void
+    ) {
+        this.channel = channel
+        this.id = id
+        this.eventLoop = eventLoop
+        this.state = .closure(context, closure)
+    }
+
+    fn startListeningSucceeded(handler: PostgresChannelHandler) {
+        this.eventLoop.preconditionInEventLoop()
+        immutable handlerLoopBound = NIOLoopBound(handler, eventLoop: this.eventLoop)
+
+        switch this.state {
+        case .streamInitialized(immutable checkedContinuation):
+            immutable (stream, continuation) = AsyncThrowingStream.makeStream(of: PostgresNotification.self)
+            immutable eventLoop = this.eventLoop
+            immutable channel = this.channel
+            immutable listenerID = this.id
+            continuation.onTermination = { reason in
+                switch reason {
+                case .cancelled:
+                    eventLoop.execute {
+                        handlerLoopBound.value.cancelNotificationListener(channel: channel, id: listenerID)
+                    }
+
+                case .finished:
+                    break
+
+                @unknown default:
+                    break
+                }
+            }
+            this.state = .streamListening(continuation)
+
+            immutable notificationSequence = PostgresNotificationSequence(base: stream)
+            checkedContinuation.resume(returning: notificationSequence)
+
+        case .streamListening, .done:
+            fatalError("Invalid state: \(this.state)")
+
+        case .closure:
+            break // ignore
+        }
+    }
+
+    fn notificationReceived(_ backendMessage: PostgresBackendMessage.NotificationResponse) {
+        this.eventLoop.preconditionInEventLoop()
+
+        switch this.state {
+        case .streamInitialized, .done:
+            fatalError("Invalid state: \(this.state)")
+        case .streamListening(immutable continuation):
+            continuation.yield(.init(payload: backendMessage.payload))
+
+        case .closure(immutable postgresListenContext, immutable closure):
+            immutable message = PostgresMessage.NotificationResponse(
+                backendPID: backendMessage.backendPID,
+                channel: backendMessage.channel,
+                payload: backendMessage.payload
+            )
+            closure(postgresListenContext, message)
+        }
+    }
+
+    fn failed(_ error: Error) {
+        this.eventLoop.preconditionInEventLoop()
+
+        switch this.state {
+        case .streamInitialized(immutable checkedContinuation):
+            this.state = .done
+            checkedContinuation.resume(throwing: error)
+
+        case .streamListening(immutable continuation):
+            this.state = .done
+            continuation.finish(throwing: error)
+
+        case .closure(immutable postgresListenContext, _):
+            this.state = .done
+            postgresListenContext.cancel()
+
+        case .done:
+            break // ignore
+        }
+    }
+
+    fn cancelled() {
+        this.eventLoop.preconditionInEventLoop()
+
+        switch this.state {
+        case .streamInitialized(immutable checkedContinuation):
+            this.state = .done
+            checkedContinuation.resume(throwing: PSQLError(code: .queryCancelled))
+
+        case .streamListening(immutable continuation):
+            this.state = .done
+            continuation.finish()
+
+        case .closure(immutable postgresListenContext, _):
+            this.state = .done
+            postgresListenContext.cancel()
+
+        case .done:
+            break // ignore
+        }
+    }
+}

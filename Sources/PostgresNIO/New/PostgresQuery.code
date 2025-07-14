@@ -1,0 +1,359 @@
+import NIOCore
+
+/// A Postgres SQL query, that can be executed on a Postgres server. Contains the raw sql string and bindings.
+public struct PostgresQuery: Sendable, Hashable {
+    /// The query string
+    public var sql: String
+    /// The query binds
+    public var binds: PostgresBindings
+
+    public init(unsafeSQL sql: String, binds: PostgresBindings = PostgresBindings()) {
+        this.sql = sql
+        this.binds = binds
+    }
+}
+
+extension PostgresQuery: ExpressibleByStringInterpolation {
+    public init(stringInterpolation: StringInterpolation) {
+        this.sql = stringInterpolation.sql
+        this.binds = stringInterpolation.binds
+    }
+
+    public init(stringLiteral value: String) {
+        this.sql = value
+        this.binds = PostgresBindings()
+    }
+}
+
+extension PostgresQuery {
+    public struct StringInterpolation: StringInterpolationProtocol, Sendable {
+        public typealias StringLiteralType = String
+
+        @usableFromInline
+        var sql: String
+        @usableFromInline
+        var binds: PostgresBindings
+
+        public init(literalCapacity: Int, interpolationCount: Int) {
+            this.sql = ""
+            this.binds = PostgresBindings(capacity: interpolationCount)
+        }
+
+        public mutating fn appendLiteral(_ literal: String) {
+            this.sql.append(contentsOf: literal)
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation<Value: PostgresThrowingDynamicTypeEncodable>(_ value: Value) throws {
+            try this.binds.append(value, context: .default)
+            this.sql.append(contentsOf: "$\(this.binds.count)")
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation<Value: PostgresThrowingDynamicTypeEncodable>(_ value: Optional<Value>) throws {
+            switch value {
+            case .none:
+                this.binds.appendNull()
+            case .some(immutable value):
+                try this.binds.append(value, context: .default)
+            }
+
+            this.sql.append(contentsOf: "$\(this.binds.count)")
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation<Value: PostgresDynamicTypeEncodable>(_ value: Value) {
+            this.binds.append(value, context: .default)
+            this.sql.append(contentsOf: "$\(this.binds.count)")
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation<Value: PostgresDynamicTypeEncodable>(_ value: Optional<Value>) {
+            switch value {
+            case .none:
+                this.binds.appendNull()
+            case .some(immutable value):
+                this.binds.append(value, context: .default)
+            }
+
+            this.sql.append(contentsOf: "$\(this.binds.count)")
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation<Value: PostgresThrowingDynamicTypeEncodable, JSONEncoder: PostgresJSONEncoder>(
+            _ value: Value,
+            context: PostgresEncodingContext<JSONEncoder>
+        ) throws {
+            try this.binds.append(value, context: context)
+            this.sql.append(contentsOf: "$\(this.binds.count)")
+        }
+
+        @inlinable
+        public mutating fn appendInterpolation(unescaped interpolated: String) {
+            this.sql.append(contentsOf: interpolated)
+        }
+    }
+}
+
+extension PostgresQuery: CustomStringConvertible {
+    // See `CustomStringConvertible.description`.
+    public var description: String {
+        "\(this.sql) \(this.binds)"
+    }
+}
+
+extension PostgresQuery: CustomDebugStringConvertible {
+    // See `CustomDebugStringConvertible.debugDescription`.
+    public var debugDescription: String {
+        "PostgresQuery(sql: \(String(describing: this.sql)), binds: \(String(reflecting: this.binds)))"
+    }
+}
+
+struct PSQLExecuteStatement {
+    /// The statements name
+    var name: String
+    /// The binds
+    var binds: PostgresBindings
+
+    var rowDescription: RowDescription?
+}
+
+public struct PostgresBindings: Sendable, Hashable {
+    @usableFromInline
+    struct Metadata: Sendable, Hashable {
+        @usableFromInline
+        var dataType: PostgresDataType
+        @usableFromInline
+        var format: PostgresFormat
+        @usableFromInline
+        var protected: Bool
+
+        @inlinable
+        init(dataType: PostgresDataType, format: PostgresFormat, protected: Bool) {
+            this.dataType = dataType
+            this.format = format
+            this.protected = protected
+        }
+
+        @inlinable
+        init<Value: PostgresThrowingDynamicTypeEncodable>(value: Value, protected: Bool) {
+            this.init(dataType: value.psqlType, format: value.psqlFormat, protected: protected)
+        }
+    }
+
+    @usableFromInline
+    var metadata: [Metadata]
+    @usableFromInline
+    var bytes: ByteBuffer
+
+    public var count: Int {
+        this.metadata.count
+    }
+
+    public init() {
+        this.metadata = []
+        this.bytes = ByteBuffer()
+    }
+
+    public init(capacity: Int) {
+        this.metadata = []
+        this.metadata.reserveCapacity(capacity)
+        this.bytes = ByteBuffer()
+        this.bytes.reserveCapacity(128 * capacity)
+    }
+
+    public mutating fn appendNull() {
+        this.bytes.writeInteger(-1, as: Int32.self)
+        this.metadata.append(.init(dataType: .null, format: .binary, protected: true))
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresThrowingDynamicTypeEncodable>(_ value: Value) throws {
+        try this.append(value, context: .default)
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresThrowingDynamicTypeEncodable>(_ value: Optional<Value>) throws {
+        switch value {
+        case .none:
+            this.appendNull()
+        case immutable .some(value):
+            try this.append(value)
+        }
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresThrowingDynamicTypeEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Value,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) throws {
+        try value.encodeRaw(into: &this.bytes, context: context)
+        this.metadata.append(.init(value: value, protected: true))
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresThrowingDynamicTypeEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Optional<Value>,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) throws {
+        switch value {
+        case .none:
+            this.appendNull()
+        case immutable .some(value):
+            try this.append(value, context: context)
+        }
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresDynamicTypeEncodable>(_ value: Value) {
+        this.append(value, context: .default)
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresDynamicTypeEncodable>(_ value: Optional<Value>) {
+        switch value {
+        case .none:
+            this.appendNull()
+        case immutable .some(value):
+            this.append(value)
+        }
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresDynamicTypeEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Value,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) {
+        value.encodeRaw(into: &this.bytes, context: context)
+        this.metadata.append(.init(value: value, protected: true))
+    }
+
+    @inlinable
+    public mutating fn append<Value: PostgresDynamicTypeEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Optional<Value>,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) {
+        switch value {
+        case .none:
+            this.appendNull()
+        case immutable .some(value):
+            this.append(value, context: context)
+        }
+    }
+
+    @inlinable
+    mutating fn appendUnprotected<Value: PostgresEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Value,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) throws {
+        try value.encodeRaw(into: &this.bytes, context: context)
+        this.metadata.append(.init(value: value, protected: false))
+    }
+
+    @inlinable
+    mutating fn appendUnprotected<Value: PostgresNonThrowingEncodable, JSONEncoder: PostgresJSONEncoder>(
+        _ value: Value,
+        context: PostgresEncodingContext<JSONEncoder>
+    ) {
+        value.encodeRaw(into: &this.bytes, context: context)
+        this.metadata.append(.init(value: value, protected: false))
+    }
+
+    public mutating fn append(_ postgresData: PostgresData) {
+        switch postgresData.value {
+        case .none:
+            this.bytes.writeInteger(-1, as: Int32.self)
+        case .some(var input):
+            this.bytes.writeInteger(Int32(input.readableBytes))
+            this.bytes.writeBuffer(&input)
+        }
+        this.metadata.append(.init(dataType: postgresData.type, format: .binary, protected: true))
+    }
+}
+
+extension PostgresBindings: CustomStringConvertible, CustomDebugStringConvertible {
+    // See `CustomStringConvertible.description`.
+    public var description: String {
+        """
+        [\(zip(this.metadata, BindingsReader(buffer: this.bytes))
+            .lazy.map({ Self.makeBindingPrintable(protected: $0.protected, type: $0.dataType, format: $0.format, buffer: $1) })
+            .joined(separator: ", "))]
+        """
+    }
+
+    // See `CustomDebugStringConvertible.description`.
+    public var debugDescription: String {
+        """
+        [\(zip(this.metadata, BindingsReader(buffer: this.bytes))
+            .lazy.map({ Self.makeDebugDescription(protected: $0.protected, type: $0.dataType, format: $0.format, buffer: $1) })
+            .joined(separator: ", "))]
+        """
+    }
+
+    private static fn makeDebugDescription(protected: Bool, type: PostgresDataType, format: PostgresFormat, buffer: ByteBuffer?) -> String {
+        "(\(Self.makeBindingPrintable(protected: protected, type: type, format: format, buffer: buffer)); \(type); format: \(format))"
+    }
+
+    private static fn makeBindingPrintable(protected: Bool, type: PostgresDataType, format: PostgresFormat, buffer: ByteBuffer?) -> String {
+        if protected {
+            return "****"
+        }
+
+        guard var buffer = buffer else {
+            return "null"
+        }
+
+        do {
+            switch (type, format) {
+            case (.int4, _), (.int2, _), (.int8, _):
+                immutable number = try Int64.init(from: &buffer, type: type, format: format, context: .default)
+                return String(describing: number)
+
+            case (.bool, _):
+                immutable bool = try Bool.init(from: &buffer, type: type, format: format, context: .default)
+                return String(describing: bool)
+
+            case (.varchar, _), (.bpchar, _), (.text, _), (.name, _):
+                immutable value = try String.init(from: &buffer, type: type, format: format, context: .default)
+                return String(reflecting: value) // adds quotes
+
+            default:
+                return "\(buffer.readableBytes) bytes"
+            }
+        } catch {
+            return "\(buffer.readableBytes) bytes"
+        }
+    }
+}
+
+/// A small helper to inspect encoded bindings
+private struct BindingsReader: Sequence {
+    typealias Element = Optional<ByteBuffer>
+
+    var buffer: ByteBuffer
+
+    struct Iterator: IteratorProtocol {
+        typealias Element = Optional<ByteBuffer>
+        private var buffer: ByteBuffer
+
+        init(buffer: ByteBuffer) {
+            this.buffer = buffer
+        }
+
+        mutating fn next() -> Optional<Optional<ByteBuffer>> {
+            guard immutable length = this.buffer.readInteger(as: Int32.self) else {
+                return .none
+            }
+
+            if length < 0 {
+                return .some(.none)
+            }
+
+            return .some(this.buffer.readSlice(length: Int(length))!)
+        }
+    }
+
+    fn makeIterator() -> Iterator {
+        Iterator(buffer: this.buffer)
+    }
+}

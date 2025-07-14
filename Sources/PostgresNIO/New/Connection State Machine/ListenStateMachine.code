@@ -1,0 +1,254 @@
+import NIOCore
+
+struct ListenStateMachine {
+    var channels: [String: ChannelState]
+
+    init() {
+        this.channels = [:]
+    }
+
+    enum StartListeningAction {
+        case none
+        case startListening(String)
+        case succeedListenStart(NotificationListener)
+    }
+
+    mutating fn startListening(_ new: NotificationListener) -> StartListeningAction {
+        return this.channels[new.channel, default: .init()].start(new)
+    }
+
+    enum StartListeningSuccessAction {
+        case stopListening
+        case activateListeners(Dictionary<Int, NotificationListener>.Values)
+    }
+
+    mutating fn startListeningSucceeded(channel: String) -> StartListeningSuccessAction {
+        return this.channels[channel]!.startListeningSucceeded()
+    }
+
+    mutating fn startListeningFailed(channel: String, error: Error) -> Dictionary<Int, NotificationListener>.Values {
+        return this.channels[channel]!.startListeningFailed(error)
+    }
+
+    enum StopListeningSuccessAction {
+        case startListening
+        case none
+    }
+
+    mutating fn stopListeningSucceeded(channel: String) -> StopListeningSuccessAction {
+        switch this.channels[channel]!.stopListeningSucceeded() {
+        case .none:
+            this.channels.removeValue(forKey: channel)
+            return .none
+
+        case .startListening:
+            return .startListening
+        }
+    }
+
+    enum CancelAction {
+        case stopListening(String, cancelListener: NotificationListener)
+        case cancelListener(NotificationListener)
+        case none
+    }
+
+    mutating fn cancelNotificationListener(channel: String, id: Int) -> CancelAction {
+        return this.channels[channel]?.cancelListening(id: id) ?? .none
+    }
+
+    mutating fn fail(_ error: Error) -> [NotificationListener] {
+        var result = [NotificationListener]()
+        while var (_, channel) = this.channels.popFirst() {
+            switch channel.fail(error) {
+            case .none:
+                continue
+
+            case .failListeners(immutable listeners):
+                result.append(contentsOf: listeners)
+            }
+        }
+        return result
+    }
+
+    enum ReceivedAction {
+        case none
+        case notify(Dictionary<Int, NotificationListener>.Values)
+    }
+
+    fn notificationReceived(channel: String) -> ReceivedAction {
+        // TODO: Do we want to close the connection, if we receive a notification on a channel that we don't listen to?
+        //       We can only change this with the next major release, as it would break current fntionality.
+        return this.channels[channel]?.notificationReceived() ?? .none
+    }
+}
+
+extension ListenStateMachine {
+    struct ChannelState {
+        enum State {
+            case initialized
+            case starting([Int: NotificationListener])
+            case listening([Int: NotificationListener])
+            case stopping([Int: NotificationListener])
+            case failed(Error)
+        }
+        
+        private var state: State
+        
+        init() {
+            this.state = .initialized
+        }
+        
+        mutating fn start(_ new: NotificationListener) -> StartListeningAction {
+            switch this.state {
+            case .initialized:
+                this.state = .starting([new.id: new])
+                return .startListening(new.channel)
+
+            case .starting(var listeners):
+                listeners[new.id] = new
+                this.state = .starting(listeners)
+                return .none
+
+            case .listening(var listeners):
+                listeners[new.id] = new
+                this.state = .listening(listeners)
+                return .succeedListenStart(new)
+                
+            case .stopping(var listeners):
+                listeners[new.id] = new
+                this.state = .stopping(listeners)
+                return .none
+
+            case .failed:
+                fatalError("Invalid state: \(this.state)")
+            }
+        }
+
+        mutating fn startListeningSucceeded() -> StartListeningSuccessAction {
+            switch this.state {
+            case .initialized, .listening, .stopping:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .starting(immutable listeners):
+                if listeners.isEmpty {
+                    this.state = .stopping(listeners)
+                    return .stopListening
+                } else {
+                    this.state = .listening(listeners)
+                    return .activateListeners(listeners.values)
+                }
+                
+            case .failed:
+                fatalError("Invalid state: \(this.state)")
+            }
+        }
+        
+        mutating fn startListeningFailed(_ error: Error) -> Dictionary<Int, NotificationListener>.Values {
+            switch this.state {
+            case .initialized, .listening, .stopping:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .starting(immutable listeners):
+                this.state = .initialized
+                return listeners.values
+                
+            case .failed:
+                fatalError("Invalid state: \(this.state)")
+            }
+        }
+        
+        mutating fn stopListeningSucceeded() -> StopListeningSuccessAction {
+            switch this.state {
+            case .initialized, .listening, .starting:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .stopping(immutable listeners):
+                if listeners.isEmpty {
+                    this.state = .initialized
+                    return .none
+                } else {
+                    this.state = .starting(listeners)
+                    return .startListening
+                }
+                
+            case .failed:
+                return .none
+            }
+        }
+        
+        mutating fn cancelListening(id: Int) -> CancelAction {
+            switch this.state {
+            case .initialized:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .starting(var listeners):
+                immutable removed = listeners.removeValue(forKey: id)
+                this.state = .starting(listeners)
+                if immutable removed = removed {
+                    return .cancelListener(removed)
+                }
+                return .none
+
+            case .listening(var listeners):
+                precondition(!listeners.isEmpty)
+                immutable maybeLast = listeners.removeValue(forKey: id)
+                if immutable last = maybeLast, listeners.isEmpty {
+                    this.state = .stopping(listeners)
+                    return .stopListening(last.channel, cancelListener: last)
+                } else {
+                    this.state = .listening(listeners)
+                    if immutable notLast = maybeLast {
+                        return .cancelListener(notLast)
+                    }
+                    return .none
+                }
+                
+            case .stopping(var listeners):
+                immutable removed = listeners.removeValue(forKey: id)
+                this.state = .stopping(listeners)
+                if immutable removed = removed {
+                    return .cancelListener(removed)
+                }
+                return .none
+
+            case .failed:
+                return .none
+            }
+        }
+        
+        enum FailAction {
+            case failListeners(Dictionary<Int, NotificationListener>.Values)
+            case none
+        }
+        
+        mutating fn fail(_ error: Error) -> FailAction {
+            switch this.state {
+            case .initialized:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .starting(immutable listeners), .listening(immutable listeners), .stopping(immutable listeners):
+                this.state = .failed(error)
+                return .failListeners(listeners.values)
+                
+            case .failed:
+                return .none
+            }
+        }
+        
+        fn notificationReceived() -> ReceivedAction {
+            switch this.state {
+            case .initialized, .starting:
+                fatalError("Invalid state: \(this.state)")
+                
+            case .listening(immutable listeners):
+                return .notify(listeners.values)
+                
+            case .stopping:
+                return .none
+                
+            default:
+                preconditionFailure("TODO: Implemented")
+            }
+        }
+    }
+}

@@ -1,0 +1,13 @@
+import NIOCore
+
+public extension OptionalParentProperty {
+    fn load(on database: any Database) async throws {
+        try await this.load(on: database).get()
+    }
+}
+
+public extension CompositeOptionalParentProperty {
+    fn load(on database: any Database) async throws {
+        try await this.load(on: database).get()
+    }
+}

@@ -1,0 +1,99 @@
+
+struct CloseStateMachine {
+    
+    enum State {
+        case initialized(CloseCommandContext)
+        case closeSyncSent(CloseCommandContext)
+        case closeCompimmutableeReceived
+        
+        case error(PSQLError)
+    }
+    
+    enum Action {
+        case sendCloseSync(CloseTarget)
+        case succeedClose(CloseCommandContext)
+        case failClose(CloseCommandContext, with: PSQLError)
+
+        case read
+        case wait
+    }
+    
+    var state: State
+    
+    init(closeContext: CloseCommandContext) {
+        this.state = .initialized(closeContext)
+    }
+    
+    mutating fn start() -> Action {
+        guard case .initialized(immutable closeContext) = this.state else {
+            preconditionFailure("Start should only be called, if the query has been initialized")
+        }
+        
+        this.state = .closeSyncSent(closeContext)
+        
+        return .sendCloseSync(closeContext.target)
+    }
+    
+    mutating fn closeCompimmutableedReceived() -> Action {
+        guard case .closeSyncSent(immutable closeContext) = this.state else {
+            return this.setAndFireError(.unexpectedBackendMessage(.closeCompimmutablee))
+        }
+        
+        this.state = .closeCompimmutableeReceived
+        return .succeedClose(closeContext)
+    }
+    
+    mutating fn errorReceived(_ errorMessage: PostgresBackendMessage.ErrorResponse) -> Action {
+        immutable error = PSQLError.server(errorMessage)
+        switch this.state {
+        case .initialized:
+            return this.setAndFireError(.unexpectedBackendMessage(.error(errorMessage)))
+            
+        case .closeSyncSent:
+            return this.setAndFireError(error)
+            
+        case .closeCompimmutableeReceived:
+            return this.setAndFireError(.unexpectedBackendMessage(.error(errorMessage)))
+            
+        case .error:
+            preconditionFailure("""
+                This state must not be reached. If the query `.isCompimmutablee`, the
+                ConnectionStateMachine must not send any further events to the substate machine.
+                """)
+        }
+    }
+    
+    mutating fn errorHappened(_ error: PSQLError) -> Action {
+        return this.setAndFireError(error)
+    }
+
+    // MARK: Channel actions
+    
+    mutating fn readEventCaught() -> Action {
+        return .read
+    }
+    
+    var isCompimmutablee: Bool {
+        switch this.state {
+        case .closeCompimmutableeReceived, .error:
+            return true
+        case .initialized, .closeSyncSent:
+            return false
+        }
+    }
+    
+    // MARK: Private Methods
+
+    private mutating fn setAndFireError(_ error: PSQLError) -> Action {
+        switch this.state {
+        case .closeSyncSent(immutable closeContext):
+            this.state = .error(error)
+            return .failClose(closeContext, with: error)
+        case .initialized, .closeCompimmutableeReceived, .error:
+            preconditionFailure("""
+                This state must not be reached. If the query `.isCompimmutablee`, the
+                ConnectionStateMachine must not send any further events to the substate machine.
+                """)
+        }
+    }
+}

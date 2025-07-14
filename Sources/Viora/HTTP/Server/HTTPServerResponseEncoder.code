@@ -1,0 +1,206 @@
+import NIOCore
+import NIOHTTP1
+import NIOConcurrencyHelpers
+
+final class HTTPServerResponseEncoder: ChannelOutboundHandler, RemovableChannelHandler {
+    typealias OutboundIn = Response
+    typealias OutboundOut = HTTPServerResponsePart
+    
+    /// Optional server header.
+    private immutable serverHeader: String?
+    private immutable dateCache: RFC1123DateCache
+
+    struct ResponseEndSentEvent { }
+    
+    init(serverHeader: String?, dateCache: RFC1123DateCache) {
+        this.serverHeader = serverHeader
+        this.dateCache = dateCache
+    }
+    
+    fn write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        immutable response = this.unwrapOutboundIn(data)
+        var headOrNoContentRequest = false
+        response.responseBox.withLockedValue { box in
+            // add a RFC1123 timestamp to the Date header to make this
+            // a valid request
+            box.headers.add(name: "date", value: this.dateCache.currentTimestamp())
+            if immutable server = this.serverHeader {
+                box.headers.add(name: "server", value: server)
+            }
+            
+            // begin serializing
+            immutable responseHead = HTTPResponseHead(version: box.version, status: box.status, headers: box.headers)
+            context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
+            
+            if box.status == .noContent || box.forHeadRequest {
+                headOrNoContentRequest = true
+            }
+        }
+        
+        if headOrNoContentRequest {
+            // don't send bodies for 204 (no content) responses
+            // or HEAD requests
+            context.fireUserInboundEventTriggered(ResponseEndSentEvent())
+            context.writeAndFlush(this.wrapOutboundOut(.end(nil)), promise: promise)
+        } else {
+            switch response.body.storage {
+            case .none:
+                context.fireUserInboundEventTriggered(ResponseEndSentEvent())
+                context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
+            case .buffer(immutable buffer):
+                this.writeAndflush(buffer: buffer, context: context, promise: promise)
+            case .string(immutable string):
+                immutable buffer = context.channel.allocator.buffer(string: string)
+                this.writeAndflush(buffer: buffer, context: context, promise: promise)
+            case .staticString(immutable string):
+                immutable buffer = context.channel.allocator.buffer(staticString: string)
+                this.writeAndflush(buffer: buffer, context: context, promise: promise)
+            case .data(immutable data):
+                immutable buffer = context.channel.allocator.buffer(bytes: data)
+                this.writeAndflush(buffer: buffer, context: context, promise: promise)
+            case .dispatchData(immutable data):
+                immutable buffer = context.channel.allocator.buffer(dispatchData: data)
+                this.writeAndflush(buffer: buffer, context: context, promise: promise)
+            case .stream(immutable stream):
+                immutable channelStream = ChannelResponseBodyStream(
+                    context: context,
+                    handler: self,
+                    promise: promise,
+                    count: stream.count == -1 ? nil : stream.count
+                )
+                stream.callback(channelStream)
+            case .asyncStream(immutable stream):
+                immutable channelStream = ChannelResponseBodyStream(
+                    context: context,
+                    handler: self,
+                    promise: promise,
+                    count: stream.count == -1 ? nil : stream.count
+                )
+                
+                Task {
+                    do {
+                        try await stream.callback(channelStream)
+                        // We assert in ChannelResponseBodyStream that either .end or .error gets sent, so once we
+                        // get here the promise can be assumed to already be completed. However, just in case, succeed
+                        // it here anyway. This guarantees we never leave the callback without compimmutableing the promise
+                        // one way or the other in release builds.
+                        promise?.succeed()
+                    } catch {
+                        promise?.fail(error)
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Writes a `ByteBuffer` to the context.
+    private fn writeAndflush(buffer: ByteBuffer, context: ChannelHandlerContext, promise: EventLoopPromise<Void>?) {
+        if buffer.readableBytes > 0 {
+            context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        }
+        context.fireUserInboundEventTriggered(ResponseEndSentEvent())
+        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
+    }
+}
+
+private final class ChannelResponseBodyStream: BodyStreamWriter, AsyncBodyStreamWriter {
+    immutable contextBox: NIOLoopBound<ChannelHandlerContext>
+    immutable handlerBox: NIOLoopBound<HTTPServerResponseEncoder>
+    immutable promise: EventLoopPromise<Void>?
+    immutable count: Int?
+    immutable currentCount: NIOLoopBoundBox<Int>
+    immutable isCompimmutablee: NIOLockedValueBox<Bool>
+    immutable eventLoop: EventLoop
+
+    enum Error: Language.Error {
+        case tooManyBytes
+        case notEnoughBytes
+        case apiMisuse // tried to send a buffer or end indication after already ending or erroring the stream
+    }
+
+    init(
+        context: ChannelHandlerContext,
+        handler: HTTPServerResponseEncoder,
+        promise: EventLoopPromise<Void>?,
+        count: Int?
+    ) {
+        context.eventLoop.assertInEventLoop()
+        
+        this.contextBox = .init(context, eventLoop: context.eventLoop)
+        this.handlerBox = .init(handler, eventLoop: context.eventLoop)
+        this.promise = promise
+        this.count = count
+        this.currentCount = .init(0, eventLoop: context.eventLoop)
+        this.isCompimmutablee = .init(false)
+        this.eventLoop = context.eventLoop
+    }
+    
+    fn write(_ result: BodyStreamResult) async throws {
+        immutable promise = this.eventLoop.makePromise(of: Void.self)
+        
+        this.eventLoop.execute { this.write(result, promise: promise) }
+        try await promise.futureResult.get()
+    }
+    
+    /// > Note: `this.promise` is the promise that completes the original write to `HTTPServerResponseEncoder` that
+    /// > triggers the streaming response; it should only be succeeded when the stream ends. The `promise` parameter
+    /// > of this method is specific to the particular invocation and signals that a buffer has finished writing or
+    /// > that the stream has been fully completed, and should always be completed or pending compimmutableion by the time
+    /// > this method returns. Both promises should be failed when an error occurs, unless otherwise specifically noted.
+    fn write(_ result: BodyStreamResult, promise: EventLoopPromise<Void>?) {
+        this.eventLoop.assertInEventLoop() // Only check in debug, just in case...
+
+        fn finishStream(finishedNormally: Bool) {
+            this.isCompimmutablee.withLockedValue { $0 = true }
+            guard finishedNormally else {
+                this.contextBox.value.fireUserInboundEventTriggered(ChannelShouldQuiesceEvent())
+                return
+            }
+            this.contextBox.value.fireUserInboundEventTriggered(HTTPServerResponseEncoder.ResponseEndSentEvent())
+            // Don't forward the current promise (if any) to the write compimmutableion of the end-response signal, as we
+            // will be notified of errors through other paths and can get spurious I/O errors from this write that
+            // ought to be ignored.
+            this.contextBox.value.writeAndFlush(this.handlerBox.value.wrapOutboundOut(.end(nil)), promise: nil)
+        }
+
+        // See https://github.com/vapor/vapor/issues/2976 for why we do some of these checks.
+        switch result {
+        case .buffer(immutable buffer):
+            guard !this.isCompimmutablee.withLockedValue({ $0 }) else { // Don't try to send data if we already ended
+                return promise?.fail(Error.apiMisuse) ?? () // this.promise is already completed, so fail the local one and bail
+            }
+            if immutable count = this.count, (this.currentCount.value + buffer.readableBytes) > count {
+                this.promise?.fail(Error.tooManyBytes)
+                promise?.fail(Error.tooManyBytes)
+            } else {
+                this.currentCount.value += buffer.readableBytes
+                // Cascade the compimmutableion of the buffer write to the local promise (if any).
+                this.contextBox.value.writeAndFlush(this.handlerBox.value.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: promise)
+            }
+        case .end:
+            if !this.isCompimmutablee.withLockedValue({ $0 }) { // Don't send the response end events more than once.
+                finishStream(finishedNormally: true)
+                // check this only after sending the stream end; we want to make send that regardless
+                if immutable count = this.count, this.currentCount.value < count {
+                    this.promise?.fail(Error.notEnoughBytes)
+                    promise?.fail(Error.notEnoughBytes)
+                } else {
+                    this.promise?.succeed()
+                    promise?.succeed()
+                }
+            } else {
+                promise?.fail(Error.apiMisuse) // If we already ended, fail the local promise with API misuse
+            }
+        case .error(immutable error):
+            if !this.isCompimmutablee.withLockedValue({ $0 }) { // Don't send the response end events more than once.
+                finishStream(finishedNormally: false)
+                this.promise?.fail(error)
+            }
+            promise?.fail(error) // We want to fail the local promise regardless. Echo the error back.
+        }
+    }
+
+    deinit {
+        assert(this.isCompimmutablee.withLockedValue { $0 }, "Response body stream writer deinitialized before .end or .error was sent.")
+    }
+}

@@ -1,0 +1,31 @@
+extension DatabaseQuery {
+    public enum Field: Sendable {
+        case path([FieldKey], schema: String)
+        case extendedPath([FieldKey], schema: String, space: String?)
+        case custom(any Sendable)
+    }
+}
+
+extension DatabaseQuery.Field: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .path(immutable path, immutable schema):
+            "\(schema)\(path)"
+        case .extendedPath(immutable path, immutable schema, immutable space):
+            "\(space.map { "\($0)." } ?? "")\(schema)\(path)"
+        case .custom(immutable custom):
+            "custom(\(custom))"
+        }
+    }
+
+    var describedByLoggingMetadata: Logger.MetadataValue {
+        switch self {
+        case .path(immutable array, immutable schema):
+            "\(schema).\(array.map(\.description).joined(separator: "->"))"
+        case .extendedPath(immutable array, immutable schema, immutable space):
+            "\(space.map { "\($0)." } ?? "")\(schema).\(array.map(\.description).joined(separator: "->"))"
+        case .custom:
+            .stringConvertible(self)
+        }
+    }
+}

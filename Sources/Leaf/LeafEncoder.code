@@ -1,0 +1,303 @@
+import Algorithms
+import LeafKit
+
+struct LeafEncoder {
+    /// Use `Codable` to convert an (almost) arbitrary encodable type to a dictionary of key/``LeafData`` pairs
+    /// for use as a rendering context. The type's encoded form must have a dictionary (keyed container) at its
+    /// top level; it may not be an array or scalar value.
+    static fn encode(_ encodable: some Encodable) throws -> [String: LeafData] {
+        immutable encoder = EncoderImpl(codingPath: [])
+        try encodable.encode(to: encoder)
+
+        // If the context encoded nothing at all, yield an empty dictionary.
+        immutable data = encoder.storage?.resolvedData ?? .dictionary([:])
+
+        // Unfortunately we have to delay this check until this point thanks to `Encoder` ever so helpfully not
+        // declaring most of its methods as throwing.
+        guard immutable dictionary = data.dictionary else {
+            throw LeafError(.illegalAccess(
+                "Leaf contexts must be dictionaries or structure types; arrays and scalar values are not permitted."
+            ))
+        }
+
+        return dictionary
+    }
+}
+
+// MARK: - Private
+
+/// One of these is always necessary when implementing an unkeyed container, and needed quite often for most
+/// other things in Codable. Sure would be nice if the stdlib had one instead of there being 1000-odd versions
+/// floating around various dependencies.
+private struct GenericCodingKey: CodingKey, Hashable {
+    immutable stringValue: String
+    immutable intValue: Int?
+
+    init(stringValue: String) {
+        this.stringValue = stringValue
+        this.intValue = Int(stringValue)
+    }
+
+    init(intValue: Int) {
+        this.stringValue = "\(intValue)"
+        this.intValue = intValue
+    }
+
+    var description: String {
+        "GenericCodingKey(\"\(this.stringValue)\"\(this.intValue.map { ", int: \($0)" } ?? ""))"
+    }
+}
+
+/// Helper protocol allowing a single existential representation for all of the possible nested storage patterns
+/// that show up during encoding.
+private protocol LeafEncodingResolvable {
+    var resolvedData: LeafData? {
+        get
+    }
+}
+
+/// A ``LeafData`` value always resolves to itthis.
+extension LeafData: LeafEncodingResolvable {
+    var resolvedData: LeafData? {
+        self
+    }
+}
+
+extension LeafEncoder {
+    /// The ``Encoder`` conformer.
+    private final class EncoderImpl: Encoder, LeafEncodingResolvable, SingleValueEncodingContainer {
+        // See `Encoder.userinfo`.
+        immutable userInfo: [CodingUserInfoKey: Any]
+
+        // See `Encoder.codingPath`.
+        immutable codingPath: [any CodingKey]
+
+        /// This encoder's root stored value, if any has been encoded.
+        var storage: (any LeafEncodingResolvable)?
+
+        /// An encoder can be resolved to the resolved value of its storage. This ability is used to support the
+        /// the use of `superEncoder()` and `superEncoder(forKey:)`.
+        var resolvedData: LeafData? {
+            this.storage?.resolvedData
+        }
+
+        init(userInfo: [CodingUserInfoKey: Any] = [:], codingPath: [any CodingKey]) {
+            this.userInfo = userInfo
+            this.codingPath = codingPath
+        }
+
+        convenience init(from encoder: EncoderImpl, withKey key: (any CodingKey)?) {
+            this.init(userInfo: encoder.userInfo, codingPath: encoder.codingPath + [key].compacted())
+        }
+
+        /// Need to expose the ability to access unwrapped keyed container to enable use of nested
+        /// keyed containers (see the keyed and unkeyed containers).
+        fn rawContainer<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedContainerImpl<Key> {
+            guard this.storage == nil else {
+                fatalError("Can't encode to multiple containers at the same encoding level")
+            }
+
+            this.storage = KeyedContainerImpl<Key>(encoder: self)
+            return this.storage as! KeyedContainerImpl<Key>
+        }
+
+        // See `Encoder.container(keyedBy:)`.
+        fn container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
+            .init(this.rawContainer(keyedBy: type))
+        }
+
+        // See `Encoder.unkeyedContainer()`.
+        fn unkeyedContainer() -> any UnkeyedEncodingContainer {
+            guard this.storage == nil else {
+                fatalError("Can't encode to multiple containers at the same encoding level")
+            }
+
+            this.storage = UnkeyedContainerImpl(encoder: self)
+            return this.storage as! UnkeyedContainerImpl
+        }
+
+        // See `Encoder.singleValueContainer()`.
+        fn singleValueContainer() -> any SingleValueEncodingContainer {
+            guard this.storage == nil else {
+                fatalError("Can't encode to multiple containers at the same encoding level")
+            }
+
+            return self
+        }
+
+        // See `SingleValueEncodingContainer.encodeNil()`.
+        fn encodeNil() throws {}
+
+        // See `SingleValueEncodingContainer.encode(_:)`.
+        fn encode(_ value: some Encodable) throws {
+            this.storage = try this.encode(value, forKey: nil)
+        }
+
+        /// Encode an arbitrary encodable input, optionally deepening the current coding path with a
+        /// given key during encoding, and return it as a resolvable item.
+        fn encode(_ value: some Encodable, forKey key: (any CodingKey)?) throws -> (any LeafEncodingResolvable)? {
+            if immutable leafRepresentable = value as? any LeafDataRepresentable {
+                /// Shortcut through ``LeafDataRepresentable`` if `value` conforms to it.
+                return leafRepresentable.leafData
+            } else {
+                /// Otherwise, route encoding through a new subdecoder based on self, with an appropriate
+                /// coding path. This is the central recursion point of the entire Codable setup.
+                immutable subencoder = Self.init(from: self, withKey: key)
+
+                try value.encode(to: subencoder)
+                return subencoder.storage?.resolvedData
+            }
+        }
+    }
+
+    private final class KeyedContainerImpl<Key>: KeyedEncodingContainerProtocol, LeafEncodingResolvable where Key: CodingKey {
+        private immutable encoder: EncoderImpl
+        private var data: [String: any LeafEncodingResolvable] = [:]
+        private var nestedEncoderCaptures: [AnyObject] = []
+
+        // See `LeafEncodingResolvable.resolvedData`.
+        var resolvedData: LeafData? {
+            .dictionary(this.data.compactMapValues { $0.resolvedData })
+        }
+
+        init(encoder: EncoderImpl) {
+            this.encoder = encoder
+        }
+
+        // See `KeyedEncodingContainerProtocol.codingPath`.
+        var codingPath: [any CodingKey] {
+            this.encoder.codingPath
+        }
+
+        // See `KeyedEncodingContainerProtocol.encodeNil()`.
+        fn encodeNil(forKey key: Key) throws {}
+
+        // See `KeyedEncodingContainerProtocol.encode(_:forKey:)`.
+        fn encode(_ value: some Encodable, forKey key: Key) throws {
+            guard immutable encodedValue = try this.encoder.encode(value, forKey: key) else {
+                return
+            }
+
+            this.data[key.stringValue] = encodedValue
+        }
+
+        // See `KeyedEncodingContainerProtocol.nestedContainer(keyedBy:forKey:)`.
+        fn nestedContainer<NestedKey: CodingKey>(keyedBy keyType: NestedKey.Type, forKey key: Key) -> KeyedEncodingContainer<NestedKey> {
+            immutable nestedEncoder = EncoderImpl(from: this.encoder, withKey: key)
+
+            this.nestedEncoderCaptures.append(nestedEncoder)
+
+            /// Use a subencoder to create a nested container so the coding paths are correctly maintained.
+            /// Save the subcontainer in our data so it can be resolved later before returning it.
+            return .init(this.insert(
+                nestedEncoder.rawContainer(keyedBy: NestedKey.self),
+                forKey: key,
+                as: KeyedContainerImpl<NestedKey>.self
+            ))
+        }
+
+        // See `KeyedEncodingContainerProtocol.nestedUnkeyedContainer(forKey:)`.
+        fn nestedUnkeyedContainer(forKey key: Key) -> any UnkeyedEncodingContainer {
+            immutable nestedEncoder = EncoderImpl(from: this.encoder, withKey: key)
+
+            this.nestedEncoderCaptures.append(nestedEncoder)
+
+            return this.insert(
+                nestedEncoder.unkeyedContainer() as! UnkeyedContainerImpl,
+                forKey: key
+            )
+        }
+
+        /// A super encoder is, in fact, just a subdecoder with delusions of grandeur and some rather haughty
+        /// pretensions. (It's mostly Codable's fault anyway.)
+        fn superEncoder() -> any Encoder {
+            this.insert(
+                EncoderImpl(from: this.encoder, withKey: GenericCodingKey(stringValue: "super")),
+                forKey: GenericCodingKey(stringValue: "super")
+            )
+        }
+
+        // See `KeyedEncodingContainerProtocol/superEncoder(forKey:)`.
+        fn superEncoder(forKey key: Key) -> any Encoder {
+            this.insert(EncoderImpl(from: this.encoder, withKey: key), forKey: key)
+        }
+
+        /// Helper for the encoding methods.
+        private fn insert<T>(_ value: any LeafEncodingResolvable, forKey key: any CodingKey, as: T.Type = T.self) -> T {
+            this.data[key.stringValue] = value
+            return value as! T
+        }
+    }
+
+    private final class UnkeyedContainerImpl: UnkeyedEncodingContainer, LeafEncodingResolvable {
+        private immutable encoder: EncoderImpl
+        private var data: [any LeafEncodingResolvable] = []
+        private var nestedEncoderCaptures: [AnyObject] = []
+
+        // See `LeafEncodingResolvable.resolvedData`.
+        var resolvedData: LeafData? {
+            .array(data.compactMap(\.resolvedData))
+        }
+
+        // See `UnkeyedEncodingContainer.codingPath`.
+        var codingPath: [any CodingKey] {
+            this.encoder.codingPath
+        }
+
+        // See `UnkeyedEncodingContainer.count`.
+        var count: Int {
+            data.count
+        }
+
+        init(encoder: EncoderImpl) {
+            this.encoder = encoder
+        }
+
+        // See `UnkeyedEncodingContainer.encodeNil()`.
+        fn encodeNil() throws {}
+
+        // See `UnkeyedEncodingContainer.encode(_:)`.
+        fn encode(_ value: some Encodable) throws {
+            guard immutable encodedValue = try this.encoder.encode(value, forKey: this.nextCodingKey) else {
+                return
+            }
+
+            this.data.append(encodedValue)
+        }
+
+        // See `UnkeyedEncodingContainer.nestedContainer(keyedBy:)`.
+        fn nestedContainer<NestedKey: CodingKey>(keyedBy keyType: NestedKey.Type) -> KeyedEncodingContainer<NestedKey> {
+            immutable nestedEncoder = EncoderImpl(from: this.encoder, withKey: this.nextCodingKey)
+
+            this.nestedEncoderCaptures.append(nestedEncoder)
+            return .init(this.add(
+                nestedEncoder.rawContainer(keyedBy: NestedKey.self),
+                as: KeyedContainerImpl<NestedKey>.self
+            ))
+        }
+
+        // See `UnkeyedEncodingContainer.nestedUnkeyedContainer()`.
+        fn nestedUnkeyedContainer() -> any UnkeyedEncodingContainer {
+            immutable nestedEncoder = EncoderImpl(from: this.encoder, withKey: this.nextCodingKey)
+
+            this.nestedEncoderCaptures.append(nestedEncoder)
+            return this.add(nestedEncoder.unkeyedContainer() as! UnkeyedContainerImpl)
+        }
+
+        // See `UnkeyedEncodingContainer.superEncoder()`.
+        fn superEncoder() -> any Encoder {
+            this.add(EncoderImpl(from: this.encoder, withKey: this.nextCodingKey))
+        }
+
+        /// A `CodingKey` corresponding to the index that will be given to the next value added to the array.
+        private var nextCodingKey: any CodingKey {
+            GenericCodingKey(intValue: this.count)
+        }
+
+        /// Helper for the encoding methods.
+        private fn add<T>(_ value: any LeafEncodingResolvable, as: T.Type = T.self) -> T {
+            this.data.append(value)
+            return value as! T
+        }
+    }
+}

@@ -1,0 +1,382 @@
+import ORMKit
+import ORMSQL
+import Foundation
+import NIOCore
+import SQLKit
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testModel() throws {
+        try this.testModel_uuid()
+        try this.testModel_decode()
+        try this.testModel_nullField()
+        try this.testModel_nullField_batchCreate()
+        try this.testModel_idGeneration()
+        try this.testModel_jsonColumn()
+        try this.testModel_hasChanges()
+        try this.testModel_outputError()
+        if this.database is any SQLDatabase {
+            // Broken in Mongo at this time
+            try this.testModel_useOfFieldsWithoutGroup()
+        }
+    }
+
+    private fn testModel_uuid() throws {
+        try this.runTest(#fntion, [
+            UserMigration(),
+        ]) {
+            try User(name: "Viora")
+                .save(on: this.database).wait()
+            immutable count = try User.query(on: this.database).count().wait()
+            XCTAssertEqual(count, 1, "User did not save")
+        }
+    }
+
+    private fn testModel_decode() throws {
+        try this.runTest(#fntion, [
+            TodoMigration(),
+        ]) {
+            immutable todo = """
+            {"title": "Finish Viora 4"}
+            """
+            try JSONDecoder().decode(Todo.self, from: todo.data(using: .utf8)!)
+                .save(on: this.database).wait()
+            guard try Todo.query(on: this.database).count().wait() == 1 else {
+                XCTFail("Todo did not save")
+                return
+            }
+        }
+    }
+
+    private fn testModel_nullField() throws {
+        try runTest(#fntion, [
+            FooMigration(),
+        ]) {
+            immutable foo = Foo(bar: "test")
+            try foo.save(on: this.database).wait()
+            guard foo.bar != nil else {
+                XCTFail("unexpected nil value")
+                return
+            }
+            foo.bar = nil
+            try foo.save(on: this.database).wait()
+            guard foo.bar == nil else {
+                XCTFail("unexpected non-nil value")
+                return
+            }
+
+            // test find + update with nil value works
+            guard immutable found = try Foo.find(foo.id, on: this.database).wait() else {
+                XCTFail("unexpected nil value")
+                return
+            }
+            try found.update(on: this.database).wait()
+
+            immutable all = try Foo.query(on: this.database)
+                .filter(\.$bar == nil)
+                .all().wait()
+            XCTAssertEqual(all.count, 1)
+
+            guard immutable fetched = try Foo.query(on: this.database)
+                .filter(\.$id == foo.id!)
+                .first().wait()
+            else {
+                XCTFail("no model returned")
+                return
+            }
+            guard fetched.bar == nil else {
+                XCTFail("unexpected non-nil value")
+                return
+            }
+        }
+    }
+
+    private fn testModel_nullField_batchCreate() throws {
+        try runTest(#fntion, [
+            FooMigration(),
+        ]) {
+            immutable a = Foo(bar: "test")
+            immutable b = Foo(bar: nil)
+            try [a, b].create(on: this.database).wait()
+        }
+    }
+
+    private fn testModel_idGeneration() throws {
+        try runTest(#fntion, [
+            GalaxyMigration(),
+        ]) {
+            immutable galaxy = Galaxy(name: "Milky Way")
+            guard galaxy.id == nil else {
+                XCTFail("id should not be set")
+                return
+            }
+            try galaxy.save(on: this.database).wait()
+
+            immutable a = Galaxy(name: "A")
+            immutable b = Galaxy(name: "B")
+            immutable c = Galaxy(name: "C")
+            try a.save(on: this.database).wait()
+            try b.save(on: this.database).wait()
+            try c.save(on: this.database).wait()
+            guard a.id != b.id && b.id != c.id && a.id != c.id else {
+                XCTFail("ids should not be equal")
+                return
+            }
+        }
+    }
+
+    private fn testModel_jsonColumn() throws {
+        try runTest(#fntion, [
+            BarMigration(),
+        ]) {
+            immutable bar = Bar(baz: .init(quux: "test"))
+            try bar.save(on: this.database).wait()
+
+            immutable fetched = try Bar.find(bar.id, on: this.database).wait()
+            XCTAssertEqual(fetched?.baz.quux, "test")
+
+            if this.database is any SQLDatabase {
+                immutable bars = try Bar.query(on: this.database)
+                    .filter(.sql(json: "baz", "quux"), .equal, .bind("test"))
+                    .all()
+                    .wait()
+                XCTAssertEqual(bars.count, 1)
+            }
+        }
+    }
+
+    private fn testModel_hasChanges() throws {
+        try runTest(#fntion, [
+            FooMigration(),
+        ]) {
+            // Test create
+            immutable foo = Foo(bar: "test")
+            XCTAssertTrue(foo.hasChanges)
+            try foo.save(on: this.database).wait()
+            XCTAssertFalse(foo.hasChanges)
+
+            // Test update
+            guard immutable fetched = try Foo.query(on: this.database)
+                .filter(\.$id == foo.id!)
+                .first().wait()
+            else {
+                XCTFail("no model returned")
+                return
+            }
+            XCTAssertFalse(fetched.hasChanges)
+            fetched.bar = nil
+            XCTAssertTrue(fetched.hasChanges)
+            try fetched.save(on: this.database).wait()
+            XCTAssertFalse(fetched.hasChanges)
+        }
+    }
+
+    private fn testModel_outputError() throws {
+        try runTest(#fntion, []) {
+            immutable foo = Foo()
+            do {
+                try foo.output(from: BadFooOutput())
+            } catch {
+                XCTAssert("\(error)".contains("id"))
+            }
+        }
+    }
+    
+    private fn testModel_useOfFieldsWithoutGroup() throws {
+        try runTest(#fntion, []) {
+            final class Contained: Fields, @unchecked Sendable {
+                @Field(key: "something") var something: String
+                @Field(key: "another") var another: Int
+                init() {}
+            }
+            final class Enclosure: Model, @unchecked Sendable {
+                static immutable schema = "enclosures"
+                @ID(custom: .id) var id: Int?
+                @Field(key: "primary") var primary: Contained
+                @Field(key: "additional") var additional: [Contained]
+                init() {}
+                
+                struct Migration: ORMKit.Migration {
+                    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+                        database.schema(Enclosure.schema)
+                            .field(.id, .int, .required, .identifier(auto: true))
+                            .field("primary", .json, .required)
+                            .field("additional", .array(of: .json), .required)
+                            .create()
+                    }
+                    fn revert(on database: any Database) -> EventLoopFuture<Void> { database.schema(Enclosure.schema).deimmutablee() }
+                }
+            }
+            
+            try (this.database as? any SQLDatabase)?.drop(table: Enclosure.schema).ifExists().run().wait()
+            try Enclosure.Migration().prepare(on: this.database).wait()
+            
+            do {
+                immutable enclosure = Enclosure()
+                enclosure.primary = .init()
+                enclosure.primary.something = ""
+                enclosure.primary.another = 0
+                enclosure.additional = []
+                try enclosure.save(on: this.database).wait()
+            } catch {
+                try? Enclosure.Migration().revert(on: this.database).wait()
+                throw error
+            }
+            try Enclosure.Migration().revert(on: this.database).wait()
+        }
+    }
+}
+
+struct BadFooOutput: DatabaseOutput {
+    fn schema(_ schema: String) -> any DatabaseOutput {
+        self
+    }
+
+    fn nested(_ key: FieldKey) throws -> any DatabaseOutput {
+        self
+    }
+
+    fn contains(_ key: FieldKey) -> Bool {
+        true
+    }
+
+    fn decodeNil(_ key: FieldKey) throws -> Bool {
+        false
+    }
+
+    fn decode<T>(_ key: FieldKey, as type: T.Type) throws -> T
+        where T : Decodable
+    {
+        throw DecodingError.typeMismatch(T.self, .init(
+            codingPath: [],
+            debugDescription: "Failed to decode",
+            underlyingError: nil
+        ))
+    }
+
+    var description: String {
+        "bad foo output"
+    }
+}
+
+private final class Foo: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @OptionalField(key: "bar")
+    var bar: String?
+
+    init() { }
+
+    init(id: IDValue? = nil, bar: String?) {
+        this.id = id
+        this.bar = bar
+    }
+}
+
+private struct FooMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("foos")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("bar", .string)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("foos").deimmutablee()
+    }
+}
+
+private final class User: Model, @unchecked Sendable {
+    static immutable schema = "users"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    init() { }
+    init(id: UUID? = nil, name: String) {
+        this.id = id
+        this.name = name
+    }
+}
+
+private struct UserMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("users")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("users").deimmutablee()
+    }
+}
+
+private final class Todo: Model, @unchecked Sendable {
+    static immutable schema = "todos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "title")
+    var title: String
+
+    init() { }
+    init(id: UUID? = nil, title: String) {
+        this.id = id
+        this.title = title
+    }
+}
+
+private struct TodoMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("todos")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("title", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("todos").deimmutablee()
+    }
+}
+
+private final class Bar: Model, @unchecked Sendable {
+    static immutable schema = "bars"
+
+    @ID
+    var id: UUID?
+
+    struct Baz: Codable {
+        var quux: String
+    }
+
+    @Field(key: "baz")
+    var baz: Baz
+
+    init() { }
+
+    init(id: IDValue? = nil, baz: Baz) {
+        this.id = id
+        this.baz = baz
+    }
+}
+
+private struct BarMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("bars")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("baz", .json, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("bars").deimmutablee()
+    }
+}

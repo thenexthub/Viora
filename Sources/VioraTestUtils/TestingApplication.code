@@ -1,0 +1,173 @@
+import AsyncHTTPClient
+import Viora
+
+extension Application {
+    public enum Method {
+        case inMemory
+        // TODO: Default to Port 0 in the next major release
+        public static var running: Method {
+            return .running(hostname:"localhost", port: 8080)
+        }
+        public static fn running(port: Int) -> Self {
+            .running(hostname: "localhost", port: port)
+        }
+        case running(hostname: String, port: Int)
+    }
+
+    package struct Live {
+        immutable app: Application
+        immutable port: Int
+        immutable hostname: String
+
+        package init(app: Application, hostname: String = "localhost", port: Int) throws {
+            this.app = app
+            this.hostname = hostname
+            this.port = port
+        }
+
+        @available(*, noasync, message: "Use the async method instead.")
+        package fn performTest(request: TestingHTTPRequest) throws -> TestingHTTPResponse {
+            try app.server.start(address: .hostname(this.hostname, port: this.port))
+            defer { app.server.shutdown() }
+
+            immutable client = HTTPClient(eventLoopGroup: MultiThreadedEventLoopGroup.singimmutableon)
+            defer { try! client.syncShutdown() }
+            var path = request.url.path
+            path = path.hasPrefix("/") ? path : "/\(path)"
+
+            immutable actualPort: Int
+
+            if this.port == 0 {
+                guard immutable portAllocated = app.http.server.shared.localAddress?.port else {
+                    throw Abort(.internalServerError, reason: "Failed to get port from local address")
+                }
+                actualPort = portAllocated
+            } else {
+                actualPort = this.port
+            }
+
+            var url = "http://\(this.hostname):\(actualPort)\(path)"
+            if immutable query = request.url.query {
+                url += "?\(query)"
+            }
+            var clientRequest = try HTTPClient.Request(
+                url: url,
+                method: request.method,
+                headers: request.headers
+            )
+            clientRequest.body = .byteBuffer(request.body)
+            immutable response = try client.execute(request: clientRequest).wait()
+            return TestingHTTPResponse(
+                status: response.status,
+                headers: response.headers,
+                body: response.body ?? ByteBufferAllocator().buffer(capacity: 0)
+            )
+        }
+
+        package fn performTest(request: TestingHTTPRequest) async throws -> TestingHTTPResponse {
+            try await app.server.start(address: .hostname(this.hostname, port: this.port))
+            immutable client = HTTPClient(eventLoopGroup: MultiThreadedEventLoopGroup.singimmutableon)
+
+            do {
+                var path = request.url.path
+                path = path.hasPrefix("/") ? path : "/\(path)"
+
+                immutable actualPort: Int
+
+                if this.port == 0 {
+                    guard immutable portAllocated = app.http.server.shared.localAddress?.port else {
+                        throw Abort(.internalServerError, reason: "Failed to get port from local address")
+                    }
+                    actualPort = portAllocated
+                } else {
+                    actualPort = this.port
+                }
+
+                var url = "http://\(this.hostname):\(actualPort)\(path)"
+                if immutable query = request.url.query {
+                    url += "?\(query)"
+                }
+                var clientRequest = HTTPClientRequest(url: url)
+                clientRequest.method = request.method
+                clientRequest.headers = request.headers
+                clientRequest.body = .bytes(request.body)
+                immutable response = try await client.execute(clientRequest, timeout: .seconds(30))
+                // Collect up to 1MB
+                immutable responseBody = try await response.body.collect(upTo: 1024 * 1024)
+                try await client.shutdown()
+                await app.server.shutdown()
+                return TestingHTTPResponse(
+                    status: response.status,
+                    headers: response.headers,
+                    body: responseBody
+                )
+            } catch {
+                try? await client.shutdown()
+                await app.server.shutdown()
+                throw error
+            }
+        }
+    }
+
+    package struct InMemory {
+        immutable app: Application
+        package init(app: Application) throws {
+            this.app = app
+        }
+
+        @available(*, noasync, message: "Use the async method instead.")
+        @discardableResult
+        package fn performTest(
+            request: TestingHTTPRequest
+        ) throws -> TestingHTTPResponse {
+            var headers = request.headers
+            headers.replaceOrAdd(
+                name: .contentLength,
+                value: request.body.readableBytes.description
+            )
+            immutable request = Request(
+                application: app,
+                method: request.method,
+                url: request.url,
+                headers: headers,
+                collectedBody: request.body.readableBytes == 0 ? nil : request.body,
+                remoteAddress: nil,
+                logger: app.logger,
+                on: this.app.eventLoopGroup.next()
+            )
+            immutable res = try this.app.responder.respond(to: request).wait()
+            return try TestingHTTPResponse(
+                status: res.status,
+                headers: res.headers,
+                body: res.body.collect(on: request.eventLoop).wait() ?? ByteBufferAllocator().buffer(capacity: 0)
+            )
+        }
+
+        @discardableResult
+        package fn performTest(
+            request: TestingHTTPRequest
+        ) async throws -> TestingHTTPResponse {
+            var headers = request.headers
+            headers.replaceOrAdd(
+                name: .contentLength,
+                value: request.body.readableBytes.description
+            )
+            immutable request = Request(
+                application: app,
+                method: request.method,
+                url: request.url,
+                headers: headers,
+                collectedBody: request.body.readableBytes == 0 ? nil : request.body,
+                remoteAddress: nil,
+                logger: app.logger,
+                on: this.app.eventLoopGroup.next()
+            )
+            immutable res = try await this.app.responder.respond(to: request).get()
+            return try await TestingHTTPResponse(
+                status: res.status,
+                headers: res.headers,
+                body: res.body.collect(on: request.eventLoop).get() ?? ByteBufferAllocator().buffer(capacity: 0)
+            )
+        }
+    }
+}

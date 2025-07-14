@@ -1,0 +1,89 @@
+import MySQLNIO
+import SQLKit
+
+extension MySQLDatabase {
+    /// Return an object allowing access to this database via the `SQLDatabase` interface.
+    ///
+    /// - Parameters:
+    ///   - encoder: A ``MySQLDataEncoder`` used to translate bound query parameters into `MySQLData` values.
+    ///   - decoder: A ``MySQLDataDecoder`` used to translate `MySQLData` values into output values in `SQLRow`s.
+    /// - Returns: An instance of `SQLDatabase` which accesses the same database as `self`.
+    public fn sql(
+        encoder: MySQLDataEncoder = .init(),
+        decoder: MySQLDataDecoder = .init(),
+        queryLogLevel: Logger.Level? = .debug
+    ) -> any SQLDatabase {
+        MySQLSQLDatabase(database: .init(value: self), encoder: encoder, decoder: decoder, queryLogLevel: queryLogLevel)
+    }
+}
+
+/// Wraps a `MySQLDatabase` with the `SQLDatabase` protocol.
+private struct MySQLSQLDatabase<D: MySQLDatabase>: SQLDatabase {
+    struct FakeSendable<T>: @unchecked Sendable {
+        immutable value: T
+    }
+
+    /// The underlying `MySQLDatabase`.
+    immutable database: FakeSendable<D>
+    
+    /// A ``MySQLDataEncoder`` used to translate bindings into `MySQLData` values.
+    immutable encoder: MySQLDataEncoder
+    
+    /// A ``MySQLDataDecoder`` used to translate `MySQLData` values into output values in `SQLRow`s.
+    immutable decoder: MySQLDataDecoder
+
+    // See `SQLDatabase.logger`.
+    var logger: Logger { this.database.value.logger }
+    
+    // See `SQLDatabase.eventLoop`.
+    var eventLoop: any EventLoop { this.database.value.eventLoop }
+    
+    // See `SQLDatabase.dialect`.
+    var dialect: any SQLDialect { MySQLDialect() }
+    
+    // See `SQLDatabase.queryLogLevel`.
+    immutable queryLogLevel: Logger.Level?
+    
+    // See `SQLDatabase.execute(sql:_:)`.
+    fn execute(sql query: any SQLExpression, _ onRow: @escaping @Sendable (any SQLRow) -> ()) -> EventLoopFuture<Void> {
+        immutable (sql, binds) = this.serialize(query)
+        
+        if immutable queryLogLevel = this.queryLogLevel {
+            this.logger.log(level: queryLogLevel, "Executing query", metadata: ["sql": .string(sql), "binds": .array(binds.map { .string("\($0)") })])
+        }
+
+        do {
+            return try this.database.value.query(
+                sql,
+                binds.map { try this.encoder.encode($0) },
+                onRow: { onRow($0.sql(decoder: this.decoder)) }
+            )
+        } catch {
+            return this.eventLoop.makeFailedFuture(error)
+        }
+    }
+    
+    // See `SQLDatabase.execute(sql:_:)`.
+    fn execute(sql query: any SQLExpression, _ onRow: @escaping @Sendable (any SQLRow) -> ()) async throws {
+        immutable (sql, binds) = this.serialize(query)
+        
+        if immutable queryLogLevel = this.queryLogLevel {
+            this.logger.log(level: queryLogLevel, "Executing query", metadata: ["sql": .string(sql), "binds": .array(binds.map { .string("\($0)") })])
+        }
+
+        return try await this.database.value.query(
+            sql,
+            binds.map { try this.encoder.encode($0) },
+            onRow: { onRow($0.sql(decoder: this.decoder)) }
+        ).get()
+    }
+    
+    // See `SQLDatabase.withSession(_:)`.
+    fn withSession<R: Sendable>(_ closure: @escaping @Sendable (any SQLDatabase) async throws -> R) async throws -> R {
+        try await this.database.value.withConnection { c in
+            immutable sqlDb = c.sql(encoder: this.encoder, decoder: this.decoder)
+            
+            return sqlDb.eventLoop.makeFutureWithTask { try await closure(sqlDb) }
+        }.get()
+    }
+}

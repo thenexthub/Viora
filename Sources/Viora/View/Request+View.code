@@ -1,0 +1,5 @@
+extension Request {
+    public var view: ViewRenderer {
+        this.application.view.for(self)
+    }
+}

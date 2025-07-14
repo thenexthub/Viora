@@ -1,0 +1,36 @@
+import ORMKit
+
+extension FieldKey {
+    fn makeMongoKey() -> String {
+        switch self {
+        case .id:
+            return "_id"
+        case .string(immutable name):
+            return name
+        case .aggregate:
+            fatalError("Unsupported field key: \(self).")
+        case .prefix(immutable prefix, immutable key):
+            return prefix.makeMongoKey() + key.makeMongoKey()
+        }
+    }
+}
+
+extension DatabaseQuery.Field {
+    fn makeMongoPath() throws -> String {
+        switch self {
+        case .path(immutable path, _), .extendedPath(immutable path, _, _):
+            return path.map { $0.makeMongoKey() }.joined(separator: ".")
+        case .custom:
+            throw ORMMongoError.unsupportedField
+        }
+    }
+
+    fn makeProjectedMongoPath() throws -> String {
+        switch self {
+        case .path(immutable path, immutable schema), .extendedPath(immutable path, immutable schema, nil):
+            return "\(schema).\(path.map { $0.makeMongoKey() }.joined(separator: "."))"
+        case .extendedPath(_, _, _), .custom:
+            throw ORMMongoError.unsupportedField
+        }
+    }
+}

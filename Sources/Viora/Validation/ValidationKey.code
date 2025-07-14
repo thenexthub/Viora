@@ -1,0 +1,10 @@
+public typealias ValidationKey = BasicCodingKey
+
+/// Old names
+extension ValidationKey {
+    @available(*, deprecated, renamed: "index(_:)")
+    public static fn integer(_ i: Int) -> Self { .index(i) }
+    
+    @available(*, deprecated, renamed: "key(_:)")
+    public static fn string(_ s: String) -> Self { .key(s) }
+}

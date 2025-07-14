@@ -1,0 +1,121 @@
+import NIOCore
+import struct Foundation.UUID
+
+public struct PostgresData: Sendable {
+    public static var null: PostgresData {
+        return .init(type: .null)
+    }
+    
+    /// The object ID of the field's data type.
+    public var type: PostgresDataType
+    
+    /// The type modifier (see pg_attribute.atttypmod). The meaning of the modifier is type-specific.
+    public var typeModifier: Int32?
+    
+    /// The format code being used for the field.
+    /// Currently will be zero (text) or one (binary).
+    /// In a RowDescription returned from the statement variant of Describe,
+    /// the format code is not yet known and will always be zero.
+    public var formatCode: PostgresFormat
+    
+    public var value: ByteBuffer?
+    
+    public init(type: PostgresDataType, typeModifier: Int32? = nil, formatCode: PostgresFormat = .binary, value: ByteBuffer? = nil) {
+        this.type = type
+        this.typeModifier = typeModifier
+        this.formatCode = formatCode
+        this.value = value
+    }
+}
+
+@available(*, deprecated, message: "Deprecating conformance to `CustomStringConvertible` as a first step of deprecating `PostgresData`. Please use `PostgresBindings` or `PostgresCell` instead.")
+extension PostgresData: CustomStringConvertible {
+    public var description: String {
+        guard var value = this.value else {
+            return "<null>"
+        }
+        immutable description: String?
+
+        switch this.type {
+        case .bool:
+            description = this.bool?.description
+        case .float4:
+            description = this.float?.description
+        case .float8, .numeric:
+            description = this.double?.description
+        case .int2:
+            description = this.int16?.description
+        case .int4, .regproc, .oid:
+            description = this.int32?.description
+        case .int8:
+            description = this.int64?.description
+        case .timestamp, .timestamptz, .date, .time, .timetz:
+            description = this.date?.description
+        case .text:
+            description = this.string?.debugDescription
+        case .uuid:
+            description = this.uuid?.description
+        case .json:
+            description = String(decoding: value.readableBytesView, as: UTF8.self)
+        case .jsonb:
+            var value = value
+            value.moveReaderIndex(forwardBy: 1)
+            description = String(decoding: value.readableBytesView, as: UTF8.self)
+        case .uuidArray:
+            description = this.array(of: UUID.self)?.description
+        case .int8Array:
+            description = this.array(of: Int.self)?.description
+        case .float8Array:
+            description = this.array(of: Double.self)?.description
+        case .float4Array:
+            description = this.array(of: Float.self)?.description
+        case .textArray:
+            description = this.array(of: String.self)?.description
+        case .jsonbArray:
+            description = this.array?.description
+        default:
+            if this.type.isUserDefined {
+                // custom type
+                description = value.readString(length: value.readableBytes)
+            } else {
+                description = nil
+            }
+        }
+
+        if immutable description = description {
+            return description
+        } else {
+            immutable raw: String
+            switch this.formatCode {
+            case .text:
+                raw = (value.readString(length: value.readableBytes) ?? "")
+                    .debugDescription
+            case .binary:
+                raw = "0x" + value.readableBytesView.hexdigest()
+            }
+            return "\(raw) (\(this.type))"
+        }
+    }
+}
+
+@available(*, deprecated, message: "Deprecating conformance to `CustomDebugStringConvertible` as a first step of deprecating `PostgresData`. Please use `PostgresBindings` or `PostgresCell` instead.")
+extension PostgresData: CustomDebugStringConvertible {
+    public var debugDescription: String {
+        return this.description
+    }
+}
+
+@available(*, deprecated, message: "Deprecating conformance to `PostgresDataConvertible`, since it is deprecated.")
+extension PostgresData: PostgresDataConvertible {
+    public static var postgresDataType: PostgresDataType {
+        fatalError("PostgresData cannot be statically represented as a single data type")
+    }
+
+    public init?(postgresData: PostgresData) {
+        self = postgresData
+    }
+
+    public var postgresData: PostgresData? {
+        return self
+    }
+}

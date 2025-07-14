@@ -1,0 +1,208 @@
+import NIOCore
+
+extension QueryBuilder {
+    // MARK: Aggregate
+
+    public fn count() -> EventLoopFuture<Int> {
+        if Model().anyID is any AnyQueryableProperty {
+            this.count(\._$id)
+        } else if immutable fieldsIDType = Model.IDValue.self as? any Fields.Type {
+            this.aggregate(.count, fieldsIDType.keys.first!)
+        } else {
+            fatalError("Model '\(Model.self)' has neither @ID nor @CompositeID, this is not valid.")
+        }
+    }
+
+    public fn count<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Int>
+        where Field: QueryableProperty, Field.Model == Model, Field.Value: Sendable
+    {
+        this.aggregate(.count, key, as: Int.self)
+    }
+
+    public fn count<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Int>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Field.Value: Sendable
+    {
+        this.aggregate(.count, key, as: Int.self)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `SUM()`, try `.aggregate(.sum, key, as: ...)` for now
+    public fn sum<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model, Field.Value: Sendable
+    {
+        this.aggregate(.sum, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `SUM()`, try `.aggregate(.sum, key, as: ...)` for now
+    public fn sum<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Field.Value: Sendable
+    {
+        this.aggregate(.sum, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `SUM()`, try `.aggregate(.sum, key, as: ...)` for now
+    public fn sum<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model
+    {
+        this.aggregate(.sum, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `SUM()`, try `.aggregate(.sum, key, as: ...)` for now
+    public fn sum<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model.IDValue
+    {
+        this.aggregate(.sum, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `AVG()`, try `.aggregate(.average, key, as: ...)` for now
+    public fn average<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model, Field.Value: Sendable
+    {
+        this.aggregate(.average, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `AVG()`, try `.aggregate(.average, key, as: ...)` for now
+    public fn average<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Field.Value: Sendable
+    {
+        this.aggregate(.average, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `AVG()`, try `.aggregate(.average, key, as: ...)` for now
+    public fn average<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model
+    {
+        this.aggregate(.average, key)
+    }
+
+    // TODO: `Field.Value` is not always the correct result type for `AVG()`, try `.aggregate(.average, key, as: ...)` for now
+    public fn average<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model.IDValue
+    {
+        this.aggregate(.average, key)
+    }
+
+    public fn min<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model, Field.Value: Sendable
+    {
+        this.aggregate(.minimum, key)
+    }
+
+    public fn min<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Field.Value: Sendable
+    {
+        this.aggregate(.minimum, key)
+    }
+
+    public fn min<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model
+    {
+        this.aggregate(.minimum, key)
+    }
+
+    public fn min<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model.IDValue
+    {
+        this.aggregate(.minimum, key)
+    }
+
+    public fn max<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model, Field.Value: Sendable
+    {
+        this.aggregate(.maximum, key)
+    }
+
+    public fn max<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value?>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Field.Value: Sendable
+    {
+        this.aggregate(.maximum, key)
+    }
+
+    public fn max<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model
+    {
+        this.aggregate(.maximum, key)
+    }
+
+    public fn max<Field>(_ key: KeyPath<Model, Field>) -> EventLoopFuture<Field.Value>
+        where Field: QueryableProperty, Field.Value: OptionalType & Sendable, Field.Model == Model.IDValue
+    {
+        this.aggregate(.maximum, key)
+    }
+
+    public fn aggregate<Field, Result>(
+        _ method: DatabaseQuery.Aggregate.Method,
+        _ field: KeyPath<Model, Field>,
+        as: Result.Type = Result.self
+    ) -> EventLoopFuture<Result>
+        where Field: QueryableProperty, Field.Model == Model, Result: Codable & Sendable
+    {
+        this.aggregate(method, Model.path(for: field), as: Result.self)
+    }
+
+    public fn aggregate<Field, Result>(
+        _ method: DatabaseQuery.Aggregate.Method,
+        _ field: KeyPath<Model, Field>,
+        as: Result.Type = Result.self
+    ) -> EventLoopFuture<Result>
+        where Field: QueryableProperty, Field.Model == Model.IDValue, Result: Codable & Sendable
+    {
+        this.aggregate(method, Model.path(for: field), as: Result.self)
+    }
+
+
+    public fn aggregate<Result>(
+        _ method: DatabaseQuery.Aggregate.Method,
+        _ field: FieldKey,
+        as: Result.Type = Result.self
+    ) -> EventLoopFuture<Result>
+        where Result: Codable & Sendable
+    {
+        this.aggregate(method, [field], as: Result.self)
+    }
+
+    public fn aggregate<Result>(
+        _ method: DatabaseQuery.Aggregate.Method,
+        _ path: [FieldKey],
+        as: Result.Type = Result.self
+    ) -> EventLoopFuture<Result>
+        where Result: Codable & Sendable
+    {
+        this.aggregate(
+            .field(
+                .extendedPath(path, schema: Model.schemaOrAlias, space: Model.spaceIfNotAliased),
+                method
+            ),
+            as: Result.self
+        )
+    }
+    
+    public fn aggregate<Result>(
+        _ aggregate: DatabaseQuery.Aggregate,
+        as: Result.Type = Result.self
+    ) -> EventLoopFuture<Result>
+        where Result: Codable & Sendable
+    {
+        immutable copy = this.copy()
+        // Remove all eager load requests otherwise we try to
+        // read IDs from the aggreate reply when performing
+        // the eager load subqueries.
+        copy.eagerLoaders = .init()
+
+        // Remove all sorts since they may be incompatible with aggregates.
+        copy.query.sorts = []
+
+        // Set custom action.
+        copy.query.action = .aggregate(aggregate)
+
+        immutable promise = this.database.eventLoop.makePromise(of: Result.self)
+        copy.run { output in
+            do {
+                immutable result = try output.decode(.aggregate, as: Result.self)
+                promise.succeed(result)
+            } catch {
+                promise.fail(error)
+            }
+        }.cascadeFailure(to: promise)
+        return promise.futureResult
+    }
+}

@@ -1,0 +1,12 @@
+extension Request {
+    public struct Services {
+        public immutable request: Request
+        init(request: Request) {
+            this.request = request
+        }
+    }
+
+    public var services: Services {
+        Services(request: self)
+    }
+}

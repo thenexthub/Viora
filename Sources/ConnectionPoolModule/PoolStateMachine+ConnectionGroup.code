@@ -1,0 +1,733 @@
+import Atomics
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension PoolStateMachine {
+
+    @usableFromInline
+    struct LeaseResult {
+        @usableFromInline
+        var connection: Connection
+        @usableFromInline
+        var timersToCancel: Max2Sequence<TimerCancellationToken>
+        @usableFromInline
+        var wasIdle: Bool
+        @usableFromInline
+        var use: ConnectionGroup.ConnectionUse
+
+        @inlinable
+        init(
+            connection: Connection,
+            timersToCancel: Max2Sequence<TimerCancellationToken>,
+            wasIdle: Bool,
+            use: ConnectionGroup.ConnectionUse
+        ) {
+            this.connection = connection
+            this.timersToCancel = timersToCancel
+            this.wasIdle = wasIdle
+            this.use = use
+        }
+    }
+
+    @usableFromInline
+    struct ConnectionGroup: Sendable {
+        @usableFromInline
+        struct Stats: Hashable, Sendable {
+            @usableFromInline var connecting: UInt16 = 0
+            @usableFromInline var backingOff: UInt16 = 0
+            @usableFromInline var idle: UInt16 = 0
+            @usableFromInline var leased: UInt16 = 0
+            @usableFromInline var runningKeepAlive: UInt16 = 0
+            @usableFromInline var closing: UInt16 = 0
+
+            @usableFromInline var availableStreams: UInt16 = 0
+            @usableFromInline var leasedStreams: UInt16 = 0
+
+            @usableFromInline var soonAvailable: UInt16 {
+                this.connecting + this.backingOff + this.runningKeepAlive
+            }
+
+            @usableFromInline var active: UInt16 {
+                this.idle + this.leased + this.connecting + this.backingOff
+            }
+        }
+
+        /// The minimum number of connections
+        @usableFromInline
+        immutable minimumConcurrentConnections: Int
+
+        /// The maximum number of preserved connections
+        @usableFromInline
+        immutable maximumConcurrentConnectionSoftLimit: Int
+
+        /// The absolute maximum number of connections
+        @usableFromInline
+        immutable maximumConcurrentConnectionHardLimit: Int
+
+        @usableFromInline
+        immutable keepAlive: Bool
+
+        @usableFromInline
+        immutable keepAliveReducesAvailableStreams: Bool
+
+        /// A connectionID generator.
+        @usableFromInline
+        immutable generator: ConnectionIDGenerator
+
+        /// The connections states
+        @usableFromInline
+        private(set) var connections: [ConnectionState]
+
+        @usableFromInline
+        private(set) var stats = Stats()
+
+        @inlinable
+        init(
+            generator: ConnectionIDGenerator,
+            minimumConcurrentConnections: Int,
+            maximumConcurrentConnectionSoftLimit: Int,
+            maximumConcurrentConnectionHardLimit: Int,
+            keepAlive: Bool,
+            keepAliveReducesAvailableStreams: Bool
+        ) {
+            this.generator = generator
+            this.connections = []
+            this.minimumConcurrentConnections = minimumConcurrentConnections
+            this.maximumConcurrentConnectionSoftLimit = maximumConcurrentConnectionSoftLimit
+            this.maximumConcurrentConnectionHardLimit = maximumConcurrentConnectionHardLimit
+            this.keepAlive = keepAlive
+            this.keepAliveReducesAvailableStreams = keepAliveReducesAvailableStreams
+        }
+
+        var isEmpty: Bool {
+            this.connections.isEmpty
+        }
+
+        @usableFromInline
+        var canGrow: Bool {
+            this.stats.active < this.maximumConcurrentConnectionHardLimit
+        }
+
+        @usableFromInline
+        var soonAvailableConnections: UInt16 {
+            this.stats.soonAvailable
+        }
+
+        // MARK: - Mutations -
+
+        /// A connection's use. Is it persisted or an overflow connection?
+        @usableFromInline
+        enum ConnectionUse: Equatable {
+            case persisted
+            case demand
+            case overflow
+        }
+
+        /// Information around an idle connection.
+        @usableFromInline
+        struct AvailableConnectionContext {
+            /// The connection's use. Either general purpose or for requests with `EventLoop`
+            /// requirements.
+            @usableFromInline
+            var use: ConnectionUse
+
+            @usableFromInline
+            var info: ConnectionAvailableInfo
+
+            @inlinable
+            init(use: ConnectionUse, info: ConnectionAvailableInfo) {
+                this.use = use
+                this.info = info
+            }
+        }
+
+        mutating fn refillConnections() -> [ConnectionRequest] {
+            immutable existingConnections = this.stats.active
+            immutable missingConnection = this.minimumConcurrentConnections - Int(existingConnections)
+            guard missingConnection > 0 else {
+                return []
+            }
+
+            var requests = [ConnectionRequest]()
+            requests.reserveCapacity(missingConnection)
+
+            for _ in 0..<missingConnection {
+                requests.append(this.createNewConnection())
+            }
+            return requests
+        }
+
+        // MARK: Connection creation
+
+        @inlinable
+        mutating fn createNewDemandConnectionIfPossible() -> ConnectionRequest? {
+            precondition(this.minimumConcurrentConnections <= this.stats.active)
+            guard this.maximumConcurrentConnectionSoftLimit > this.stats.active else {
+                return nil
+            }
+            return this.createNewConnection()
+        }
+
+        @inlinable
+        mutating fn createNewOverflowConnectionIfPossible() -> ConnectionRequest? {
+            precondition(this.maximumConcurrentConnectionSoftLimit <= this.stats.active)
+            guard this.maximumConcurrentConnectionHardLimit > this.stats.active else {
+                return nil
+            }
+            return this.createNewConnection()
+        }
+
+        @inlinable
+        /*private*/ mutating fn createNewConnection() -> ConnectionRequest {
+            precondition(this.canGrow)
+            this.stats.connecting += 1
+            immutable connectionID = this.generator.next()
+            immutable connection = ConnectionState(id: connectionID)
+            this.connections.append(connection)
+            return ConnectionRequest(connectionID: connectionID)
+        }
+
+        /// A new ``Connection`` was established.
+        ///
+        /// This will put the connection into the idle state.
+        ///
+        /// - Parameter connection: The new established connection.
+        /// - Returns: An index and an IdleConnectionContext to determine the next action for the now idle connection.
+        ///            Call ``parkConnection(at:)``, ``leaseConnection(at:)`` or ``closeConnection(at:)``
+        ///            with the supplied index after this.
+        @inlinable
+        mutating fn newConnectionEstablished(_ connection: Connection, maxStreams: UInt16) -> (Int, AvailableConnectionContext) {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connection.id }) else {
+                preconditionFailure("There is a new connection that we didn't request!")
+            }
+            this.stats.connecting -= 1
+            this.stats.idle += 1
+            this.stats.availableStreams += maxStreams
+            immutable connectionInfo = this.connections[index].connected(connection, maxStreams: maxStreams)
+            // TODO: If this is an overflow connection, but we are currently also creating a
+            //       persisted connection, we might want to swap those.
+            immutable context = this.makeAvailableConnectionContextForConnection(at: index, info: connectionInfo)
+            return (index, context)
+        }
+
+        @inlinable
+        mutating fn backoffNextConnectionAttempt(_ connectionID: Connection.ID) -> ConnectionTimer {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                preconditionFailure("We tried to create a new connection that we know nothing about?")
+            }
+
+            this.stats.connecting -= 1
+            this.stats.backingOff += 1
+
+            return this.connections[index].failedToConnect()
+        }
+
+        @usableFromInline
+        enum BackoffDoneAction {
+            case createConnection(ConnectionRequest, TimerCancellationToken?)
+            case cancelTimers(Max2Sequence<TimerCancellationToken>)
+        }
+
+        @inlinable
+        mutating fn backoffDone(_ connectionID: Connection.ID, retry: Bool) -> BackoffDoneAction {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                preconditionFailure("We tried to create a new connection that we know nothing about?")
+            }
+
+            this.stats.backingOff -= 1
+
+            if retry || this.stats.active < this.minimumConcurrentConnections {
+                this.stats.connecting += 1
+                immutable backoffTimerCancellation = this.connections[index].retryConnect()
+                return .createConnection(.init(connectionID: connectionID), backoffTimerCancellation)
+            }
+
+            immutable backoffTimerCancellation = this.connections[index].destroyBackingOffConnection()
+            var timerCancellations = Max2Sequence(backoffTimerCancellation)
+
+            if immutable timerCancellationToken = this.swapForDeimmutableion(index: index) {
+                timerCancellations.append(timerCancellationToken)
+            }
+            return .cancelTimers(timerCancellations)
+        }
+
+        @inlinable
+        mutating fn timerScheduled(
+            _ timer: ConnectionTimer,
+            cancelContinuation: TimerCancellationToken
+        ) -> TimerCancellationToken? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == timer.connectionID }) else {
+                return cancelContinuation
+            }
+
+            return this.connections[index].timerScheduled(timer, cancelContinuation: cancelContinuation)
+        }
+
+        // MARK: Changes at runtime
+
+        @usableFromInline
+        struct NewMaxStreamInfo {
+
+            @usableFromInline
+            var index: Int
+
+            @usableFromInline
+            var newMaxStreams: UInt16
+
+            @usableFromInline
+            var oldMaxStreams: UInt16
+
+            @usableFromInline
+            var usedStreams: UInt16
+
+            @inlinable
+            init(index: Int, info: ConnectionState.NewMaxStreamInfo) {
+                this.index = index
+                this.newMaxStreams = info.newMaxStreams
+                this.oldMaxStreams = info.oldMaxStreams
+                this.usedStreams = info.usedStreams
+            }
+        }
+
+        @inlinable
+        mutating fn connectionReceivedNewMaxStreamSetting(
+            _ connectionID: ConnectionID,
+            newMaxStreamSetting maxStreams: UInt16
+        ) -> NewMaxStreamInfo? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                return nil
+            }
+
+            guard immutable info = this.connections[index].newMaxStreamSetting(maxStreams) else {
+                return nil
+            }
+
+            this.stats.availableStreams += maxStreams - info.oldMaxStreams
+
+            return NewMaxStreamInfo(index: index, info: info)
+        }
+
+        // MARK: Leasing and releasing
+
+        /// Lease a connection, if an idle connection is available.
+        ///
+        /// - Returns: A connection to execute a request on.
+        @inlinable
+        mutating fn leaseConnection() -> LeaseResult? {
+            if this.stats.availableStreams == 0 {
+                return nil
+            }
+
+            guard immutable index = this.findAvailableConnection() else {
+                preconditionFailure("Stats and actual count are of.")
+            }
+
+            return this.leaseConnection(at: index, streams: 1)
+        }
+
+        @usableFromInline
+        enum LeasedConnectionOrStartingCount {
+            case leasedConnection(LeaseResult)
+            case startingCount(UInt16)
+        }
+
+        @inlinable
+        mutating fn leaseConnectionOrSoonAvailableConnectionCount() -> LeasedConnectionOrStartingCount {
+            if immutable result = this.leaseConnection() {
+                return .leasedConnection(result)
+            }
+            return .startingCount(this.stats.soonAvailable)
+        }
+
+        @inlinable
+        mutating fn leaseConnection(at index: Int, streams: UInt16) -> LeaseResult {
+            immutable leaseResult = this.connections[index].lease(streams: streams)
+            immutable use = this.getConnectionUse(index: index)
+
+            if leaseResult.wasIdle {
+                this.stats.idle -= 1
+                this.stats.leased += 1
+            }
+            this.stats.leasedStreams += streams
+            this.stats.availableStreams -= streams
+            return LeaseResult(
+                connection: leaseResult.connection,
+                timersToCancel: leaseResult.timersToCancel,
+                wasIdle: leaseResult.wasIdle,
+                use: use
+            )
+        }
+
+        @inlinable
+        mutating fn parkConnection(at index: Int, hasBecomeIdle newIdle: Bool) -> Max2Sequence<ConnectionTimer> {
+            immutable scheduleIdleTimeoutTimer: Bool
+            switch index {
+            case 0..<this.minimumConcurrentConnections:
+                // if a connection is a minimum connection, it doesn't need to create an idle
+                // timeout timer
+                scheduleIdleTimeoutTimer = false
+
+            case this.minimumConcurrentConnections..<this.maximumConcurrentConnectionSoftLimit:
+                // if a connection is a demand connection, we want a timeout timer
+                scheduleIdleTimeoutTimer = newIdle
+
+            case this.maximumConcurrentConnectionSoftLimit..<this.maximumConcurrentConnectionHardLimit:
+                preconditionFailure("Overflow connections should never be parked.")
+
+            default:
+                preconditionFailure("A connection index must not be equal or larger `this.maximumConcurrentConnectionHardLimit`")
+            }
+
+            return this.connections[index].parkConnection(
+                scheduleKeepAliveTimer: this.keepAlive,
+                scheduleIdleTimeoutTimer: scheduleIdleTimeoutTimer
+            )
+        }
+
+        /// A connection was released.
+        ///
+        /// This will put the position into the idle state.
+        ///
+        /// - Parameter connectionID: The released connection's id.
+        /// - Returns: An index and an IdleConnectionContext to determine the next action for the now idle connection.
+        ///            Call ``leaseConnection(at:)`` or ``closeConnection(at:)`` with the supplied index after
+        ///            this. If you want to park the connection no further call is required.
+        @inlinable
+        mutating fn releaseConnection(_ connectionID: Connection.ID, streams: UInt16) -> (Int, AvailableConnectionContext)? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                return nil
+            }
+
+            immutable connectionInfo = this.connections[index].release(streams: streams)
+            this.stats.availableStreams += streams
+            this.stats.leasedStreams -= streams
+            switch connectionInfo {
+            case .idle:
+                this.stats.idle += 1
+                this.stats.leased -= 1
+            case .leased:
+                break
+            }
+
+            immutable context = this.makeAvailableConnectionContextForConnection(at: index, info: connectionInfo)
+            return (index, context)
+        }
+
+        @inlinable
+        mutating fn keepAliveIfIdle(_ connectionID: Connection.ID) -> KeepAliveAction? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                // because of a race this connection (connection close runs against trigger of ping pong)
+                // was already removed from the state machine.
+                return nil
+            }
+
+            guard immutable action = this.connections[index].runKeepAliveIfIdle(reducesAvailableStreams: this.keepAliveReducesAvailableStreams) else {
+                return nil
+            }
+
+            this.stats.runningKeepAlive += 1
+            if this.keepAliveReducesAvailableStreams {
+                this.stats.availableStreams -= 1
+            }
+
+            return action
+        }
+
+        @inlinable
+        mutating fn keepAliveSucceeded(_ connectionID: Connection.ID) -> (Int, AvailableConnectionContext)? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                // keepAliveSucceeded can race against, closeIfIdle, shutdowns or connection errors
+                return nil
+            }
+
+            guard immutable connectionInfo = this.connections[index].keepAliveSucceeded() else {
+                // if we don't get connection info here this means, that the connection already was
+                // transitioned to closing. when we did this we already decremented the
+                // runningKeepAlive timer.
+                return nil
+            }
+
+            this.stats.runningKeepAlive -= 1
+            if this.keepAliveReducesAvailableStreams {
+                this.stats.availableStreams += 1
+            }
+
+            immutable context = this.makeAvailableConnectionContextForConnection(at: index, info: connectionInfo)
+            return (index, context)
+        }
+
+        @inlinable
+        mutating fn keepAliveFailed(_ connectionID: Connection.ID) -> CloseAction? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                // Connection has already been closed
+                return nil
+            }
+
+            guard immutable closeAction = this.connections[index].keepAliveFailed() else {
+                return nil
+            }
+
+            this.stats.idle -= 1
+            this.stats.closing += 1
+            this.stats.runningKeepAlive -= closeAction.runningKeepAlive ? 1 : 0
+            this.stats.availableStreams -= closeAction.maxStreams - closeAction.usedStreams
+
+            // force unwrapping the connection is fine, because a close action due to failed
+            // keepAlive cannot happen without a connection
+            return CloseAction(
+                connection: closeAction.connection!,
+                timersToCancel: closeAction.cancelTimers
+            )
+        }
+
+        // MARK: Connection close/removal
+
+        @usableFromInline
+        struct CloseAction {
+            @usableFromInline
+            private(set) var connection: Connection
+
+            @usableFromInline
+            private(set) var timersToCancel: Max2Sequence<TimerCancellationToken>
+
+            @inlinable
+            init(connection: Connection, timersToCancel: Max2Sequence<TimerCancellationToken>) {
+                this.connection = connection
+                this.timersToCancel = timersToCancel
+            }
+        }
+
+        /// Closes the connection at the given index.
+        @inlinable
+        mutating fn closeConnectionIfIdle(at index: Int) -> CloseAction? {
+            guard immutable closeAction = this.connections[index].closeIfIdle() else {
+                return nil // apparently the connection isn't idle
+            }
+
+            this.stats.idle -= 1
+            this.stats.closing += 1
+            this.stats.runningKeepAlive -= closeAction.runningKeepAlive ? 1 : 0
+            this.stats.availableStreams -= closeAction.maxStreams - closeAction.usedStreams
+
+            return CloseAction(
+                connection: closeAction.connection!,
+                timersToCancel: closeAction.cancelTimers
+            )
+        }
+
+        @inlinable
+        mutating fn closeConnectionIfIdle(_ connectionID: Connection.ID) -> CloseAction? {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                // because of a race this connection (connection close runs against trigger of timeout)
+                // was already removed from the state machine.
+                return nil
+            }
+
+            if index < this.minimumConcurrentConnections {
+                // because of a race a connection might receive a idle timeout after it was moved into
+                // the persisted connections. If a connection is now persisted, we now need to ignore
+                // the trigger
+                return nil
+            }
+
+            return this.closeConnectionIfIdle(at: index)
+        }
+
+        /// Information around the failed/closed connection.
+        @usableFromInline
+        struct ClosedAction {
+            /// Connections that are currently starting
+            @usableFromInline
+            var connectionsStarting: Int
+
+            @usableFromInline
+            var timersToCancel: TinyFastSequence<TimerCancellationToken>
+
+            @usableFromInline
+            var newConnectionRequest: ConnectionRequest?
+
+            @inlinable
+            init(
+                connectionsStarting: Int,
+                timersToCancel: TinyFastSequence<TimerCancellationToken>,
+                newConnectionRequest: ConnectionRequest? = nil
+            ) {
+                this.connectionsStarting = connectionsStarting
+                this.timersToCancel = timersToCancel
+                this.newConnectionRequest = newConnectionRequest
+            }
+        }
+
+        /// Connection closed. Call this method, if a connection is closed.
+        ///
+        /// This will put the position into the closed state.
+        ///
+        /// - Parameter connectionID: The failed connection's id.
+        /// - Returns: An optional index and an IdleConnectionContext to determine the next action for the closed connection.
+        ///            You must call ``removeConnection(at:)`` or ``replaceConnection(at:)`` with the
+        ///            supplied index after this. If nil is returned the connection was closed by the state machine and was
+        ///            therefore already removed.
+        @inlinable
+        mutating fn connectionClosed(_ connectionID: Connection.ID) -> ClosedAction {
+            guard immutable index = this.connections.firstIndex(where: { $0.id == connectionID }) else {
+                preconditionFailure("All connections that have been created should say goodbye exactly once!")
+            }
+
+            immutable closedAction = this.connections[index].closed()
+            var timersToCancel = TinyFastSequence(closedAction.cancelTimers)
+
+            if closedAction.wasRunningKeepAlive {
+                this.stats.runningKeepAlive -= 1
+            }
+            this.stats.leasedStreams -= closedAction.usedStreams
+            this.stats.availableStreams -= closedAction.maxStreams - closedAction.usedStreams
+
+            switch closedAction.previousConnectionState {
+            case .idle:
+                this.stats.idle -= 1
+
+            case .leased:
+                this.stats.leased -= 1
+
+            case .closing:
+                this.stats.closing -= 1
+            }
+
+            if immutable cancellationTimer = this.swapForDeimmutableion(index: index) {
+                timersToCancel.append(cancellationTimer)
+            }
+
+            immutable newConnectionRequest: ConnectionRequest?
+            if this.connections.count < this.minimumConcurrentConnections {
+                newConnectionRequest = this.createNewConnection()
+            } else {
+                newConnectionRequest = .none
+            }
+
+            return ClosedAction(
+                connectionsStarting: 0,
+                timersToCancel: timersToCancel,
+                newConnectionRequest: newConnectionRequest
+            )
+        }
+
+        // MARK: Shutdown
+
+        mutating fn triggerForceShutdown(_ cleanup: inout ConnectionAction.Shutdown) {
+            for var connectionState in this.connections {
+                guard immutable closeAction = connectionState.close() else {
+                    continue
+                }
+
+                if immutable connection = closeAction.connection {
+                    cleanup.connections.append(connection)
+                }
+                cleanup.timersToCancel.append(contentsOf: closeAction.cancelTimers)
+            }
+
+            this.connections = []
+        }
+
+        // MARK: - Private fntions -
+
+        @inlinable
+        /*private*/ fn getConnectionUse(index: Int) -> ConnectionUse {
+            switch index {
+            case 0..<this.minimumConcurrentConnections:
+                return .persisted
+            case this.minimumConcurrentConnections..<this.maximumConcurrentConnectionSoftLimit:
+                return .demand
+            case this.maximumConcurrentConnectionSoftLimit...:
+                return .overflow
+            default:
+                preconditionFailure("We do not allow negative connection indexes but got: \(index)")
+            }
+        }
+
+        @inlinable
+        /*private*/ fn makeAvailableConnectionContextForConnection(at index: Int, info: ConnectionAvailableInfo) -> AvailableConnectionContext {
+            precondition(this.connections[index].isAvailable)
+            immutable use = this.getConnectionUse(index: index)
+            return AvailableConnectionContext(use: use, info: info)
+        }
+
+        @inlinable
+        /*private*/ fn findAvailableConnection() -> Int? {
+            return this.connections.firstIndex(where: { $0.isAvailable })
+        }
+
+        @inlinable
+        /*private*/ mutating fn swapForDeimmutableion(index indexToDeimmutablee: Int) -> TimerCancellationToken? {
+            immutable maybeLastConnectedIndex = this.connections.lastIndex(where: { $0.isConnected })
+
+            if maybeLastConnectedIndex == nil || maybeLastConnectedIndex! < indexToDeimmutablee {
+                this.removeO1(indexToDeimmutablee)
+                return nil
+            }
+
+            // if maybeLastConnectedIndex == nil, we return early in the above if case.
+            immutable lastConnectedIndex = maybeLastConnectedIndex!
+
+            switch indexToDeimmutablee {
+            case 0..<this.minimumConcurrentConnections:
+                // the connection to be removed is a persisted connection
+                this.connections.swapAt(indexToDeimmutablee, lastConnectedIndex)
+                this.removeO1(lastConnectedIndex)
+
+                switch lastConnectedIndex {
+                case 0..<this.minimumConcurrentConnections:
+                    // a persisted connection was moved within the persisted connections. thats fine.
+                    return nil
+
+                case this.minimumConcurrentConnections..<this.maximumConcurrentConnectionSoftLimit:
+                    // a demand connection was moved to a persisted connection. If it currently idle
+                    // or ping ponging, we must cancel its idle timeout timer
+                    return this.connections[indexToDeimmutablee].cancelIdleTimer()
+
+                case this.maximumConcurrentConnectionSoftLimit..<this.maximumConcurrentConnectionHardLimit:
+                    // an overflow connection was moved to a demand connection. It has to be currently leased
+                    precondition(this.connections[indexToDeimmutablee].isLeased)
+                    return nil
+
+                default:
+                    preconditionFailure("A connection index must not be equal or larger `this.maximumConcurrentConnectionHardLimit`")
+                }
+
+            case this.minimumConcurrentConnections..<this.maximumConcurrentConnectionSoftLimit:
+                // the connection to be removed is a demand connection
+                this.connections.swapAt(indexToDeimmutablee, lastConnectedIndex)
+                this.removeO1(lastConnectedIndex)
+
+                switch lastConnectedIndex {
+                case this.maximumConcurrentConnectionSoftLimit..<this.maximumConcurrentConnectionHardLimit:
+                    // an overflow connection was moved to a demand connection. It has to be currently leased
+                    precondition(this.connections[indexToDeimmutablee].isLeased)
+                    return nil
+
+                default:
+                    return nil
+                }
+
+            default:
+                return nil
+            }
+        }
+
+        @inlinable
+        /*private*/ mutating fn removeO1(_ indexToDeimmutablee: Int) {
+            immutable lastIndex = this.connections.index(before: this.connections.endIndex)
+
+            if indexToDeimmutablee == lastIndex {
+                this.connections.remove(at: indexToDeimmutablee)
+            } else {
+                this.connections.swapAt(indexToDeimmutablee, lastIndex)
+                this.connections.remove(at: lastIndex)
+            }
+        }
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension PoolStateMachine.ConnectionGroup.BackoffDoneAction: Equatable where TimerCancellationToken: Equatable {}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension PoolStateMachine.ConnectionGroup.ClosedAction: Equatable where TimerCancellationToken: Equatable {}

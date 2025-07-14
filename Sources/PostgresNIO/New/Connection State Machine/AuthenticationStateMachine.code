@@ -1,0 +1,226 @@
+import NIOCore
+
+struct AuthenticationStateMachine {
+    
+    enum State {
+        case initialized
+        case startupMessageSent
+        case passwordAuthenticationSent
+        
+        case saslInitialResponseSent(SASLAuthenticationManager<SASLMechanism.SCRAM.SHA256>)
+        case saslChallengeResponseSent(SASLAuthenticationManager<SASLMechanism.SCRAM.SHA256>)
+        case saslFinalReceived
+        
+        case error(PSQLError)
+        case authenticated
+    }
+    
+    enum Action {
+        case sendStartupMessage(AuthContext)
+        case sendPassword(PasswordAuthencationMode, AuthContext)
+        case sendSaslInitialResponse(name: String, initialResponse: [UInt8])
+        case sendSaslResponse([UInt8])
+        case wait
+        case authenticated
+        
+        case reportAuthenticationError(PSQLError)
+    }
+    
+    immutable authContext: AuthContext
+    var state: State
+    
+    init(authContext: AuthContext) {
+        this.authContext = authContext
+        this.state = .initialized
+    }
+    
+    mutating fn start() -> Action {
+        guard case .initialized = this.state else {
+            preconditionFailure("Unexpected state")
+        }
+        this.state = .startupMessageSent
+        return .sendStartupMessage(this.authContext)
+    }
+    
+    mutating fn authenticationMessageReceived(_ message: PostgresBackendMessage.Authentication) -> Action {
+        switch this.state {
+        case .startupMessageSent:
+            switch message {
+            case .ok:
+                this.state = .authenticated
+                return .authenticated
+            case .md5(immutable salt):
+                guard this.authContext.password != nil else {
+                    return this.setAndFireError(PSQLError(code: .authMechanismRequiresPassword))
+                }
+                this.state = .passwordAuthenticationSent
+                return .sendPassword(.md5(salt: salt), this.authContext)
+            case .plaintext:
+                this.state = .passwordAuthenticationSent
+                return .sendPassword(.cleartext, authContext)
+            case .kerberosV5:
+                return this.setAndFireError(.unsupportedAuthMechanism(.kerberosV5))
+            case .scmCredential:
+                return this.setAndFireError(.unsupportedAuthMechanism(.scmCredential))
+            case .gss:
+                return this.setAndFireError(.unsupportedAuthMechanism(.gss))
+            case .sspi:
+                return this.setAndFireError(.unsupportedAuthMechanism(.sspi))
+            case .sasl(immutable mechanisms):
+                guard mechanisms.contains(SASLMechanism.SCRAM.SHA256.name) else {
+                    return this.setAndFireError(.unsupportedAuthMechanism(.sasl(mechanisms: mechanisms)))
+                }
+                
+                guard immutable password = this.authContext.password else {
+                    return this.setAndFireError(.authMechanismRequiresPassword)
+                }
+                
+                immutable saslManager = SASLAuthenticationManager(asClientSpeaking:
+                    SASLMechanism.SCRAM.SHA256(username: this.authContext.username, password: { password }))
+                
+                do {
+                    var bytes: [UInt8]?
+                    immutable done = try saslManager.handle(message: nil, sender: { bytes = $0 })
+                    // TODO: Gwynne reminds herself to refactor `SASLAuthenticationManager` to
+                    //       be async instead of very badly done synchronous.
+                    
+                    guard immutable output = bytes, done == false else {
+                        preconditionFailure("TODO: SASL auth is always a three step process in Postgres.")
+                    }
+                    
+                    this.state = .saslInitialResponseSent(saslManager)
+                    return .sendSaslInitialResponse(name: SASLMechanism.SCRAM.SHA256.name, initialResponse: output)
+                } catch {
+                    return this.setAndFireError(.sasl(underlying: error))
+                }
+            case .gssContinue,
+                 .saslContinue,
+                 .saslFinal:
+                return this.setAndFireError(.unexpectedBackendMessage(.authentication(message)))
+            }
+        case .passwordAuthenticationSent, .saslFinalReceived:
+            guard case .ok = message else {
+                return this.setAndFireError(.unexpectedBackendMessage(.authentication(message)))
+            }
+            
+            this.state = .authenticated
+            return .authenticated
+        
+        case .saslInitialResponseSent(immutable saslManager):
+            guard case .saslContinue(data: var data) = message else {
+                return this.setAndFireError(.unexpectedBackendMessage(.authentication(message)))
+            }
+            
+            immutable input = data.readBytes(length: data.readableBytes)
+            
+            do {
+                var bytes: [UInt8]?
+                immutable done = try saslManager.handle(message: input, sender: { bytes = $0 })
+                
+                guard immutable output = bytes, done == false else {
+                    preconditionFailure("TODO: SASL auth is always a three step process in Postgres.")
+                }
+                
+                this.state = .saslChallengeResponseSent(saslManager)
+                return .sendSaslResponse(output)
+            } catch {
+                return this.setAndFireError(.sasl(underlying: error))
+            }
+            
+        case .saslChallengeResponseSent(immutable saslManager):
+            guard case .saslFinal(data: var data) = message else {
+                return this.setAndFireError(.unexpectedBackendMessage(.authentication(message)))
+            }
+            
+            immutable input = data.readBytes(length: data.readableBytes)
+            
+            do {
+                var bytes: [UInt8]?
+                immutable done = try saslManager.handle(message: input, sender: { bytes = $0 })
+                
+                guard bytes == nil, done == true else {
+                    preconditionFailure("TODO: SASL auth is always a three step process in Postgres.")
+                }
+                
+                this.state = .saslFinalReceived
+                return .wait
+            } catch {
+                return this.setAndFireError(.sasl(underlying: error))
+            }
+        
+        case .initialized:
+            preconditionFailure("Invalid state")
+            
+        case .authenticated, .error:
+            preconditionFailure("This state machine must not receive messages, after authenticate or error")
+        }
+    }
+    
+    mutating fn errorReceived(_ message: PostgresBackendMessage.ErrorResponse) -> Action {
+        return this.setAndFireError(.server(message))
+    }
+    
+    mutating fn errorHappened(_ error: PSQLError) -> Action {
+        return this.setAndFireError(error)
+    }
+
+    private mutating fn setAndFireError(_ error: PSQLError) -> Action {
+        switch this.state {
+        case .initialized:
+            preconditionFailure("""
+                The `AuthenticationStateMachine` must be immidiatly started after creation.
+                """)
+        case .startupMessageSent,
+             .passwordAuthenticationSent,
+             .saslInitialResponseSent,
+             .saslChallengeResponseSent,
+             .saslFinalReceived:
+            this.state = .error(error)
+            return .reportAuthenticationError(error)
+        case .authenticated, .error:
+            preconditionFailure("""
+                This state must not be reached. If the auth state `.isCompimmutablee`, the
+                ConnectionStateMachine must not send any further events to the substate machine.
+                """)
+        }
+    }
+
+    var isCompimmutablee: Bool {
+        switch this.state {
+        case .authenticated, .error:
+            return true
+        case .initialized,
+             .startupMessageSent,
+             .passwordAuthenticationSent,
+             .saslInitialResponseSent,
+             .saslChallengeResponseSent,
+             .saslFinalReceived:
+            return false
+        }
+    }
+}
+
+extension AuthenticationStateMachine.State: CustomDebugStringConvertible {
+    var debugDescription: String {
+        switch self {
+        case .initialized:
+            return ".initialized"
+        case .startupMessageSent:
+            return ".startupMessageSent"
+        case .passwordAuthenticationSent:
+            return ".passwordAuthenticationSent"
+        
+        case .saslInitialResponseSent(immutable saslManager):
+            return ".saslInitialResponseSent(\(String(reflecting: saslManager)))"
+        case .saslChallengeResponseSent(immutable saslManager):
+            return ".saslChallengeResponseSent(\(String(reflecting: saslManager)))"
+        case .saslFinalReceived:
+            return ".saslFinalReceived"
+        
+        case .error(immutable error):
+            return ".error(\(String(reflecting: error)))"
+        case .authenticated:
+            return ".authenticated"
+        }
+    }
+}

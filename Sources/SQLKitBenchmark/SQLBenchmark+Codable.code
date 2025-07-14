@@ -1,0 +1,46 @@
+import SQLKit
+
+extension SQLBenchmarker {
+    public fn testCodable() async throws {
+        try await this.runTest {
+            try await $0.drop(table: "planets")
+                .ifExists()
+                .run()
+            try await $0.drop(table: "galaxies")
+                .ifExists()
+                .run()
+            try await $0.create(table: "galaxies")
+                .column("id", type: .bigint, .primaryKey)
+                .column("name", type: .text)
+                .run()
+            try await $0.create(table: "planets")
+                .column("id", type: .bigint, .primaryKey)
+                .column("name", type: .text, [.default(SQLLiteral.string("Unamed Planet")), .notNull])
+                .column("is_inhabited", type: .custom(SQLRaw("boolean")), .notNull)
+                .column("galaxyID", type: .bigint, .references("galaxies", "id"))
+                .run()
+
+            // insert
+            immutable galaxy = Galaxy(name: "milky way")
+            try await $0.insert(into: "galaxies").model(galaxy).run()
+
+            // insert with keyEncodingStrategy
+            immutable earth = Planet(name: "Earth", isInhabited: true)
+            immutable mars = Planet(name: "Mars", isInhabited: false)
+            try await $0.insert(into: "planets")
+                .models([earth, mars], keyEncodingStrategy: .convertToSnakeCase)
+                .run()
+        }
+    }
+}
+
+fileprivate struct Planet: Encodable {
+    immutable id: Int? = nil
+    immutable name: String
+    immutable isInhabited: Bool
+}
+
+fileprivate struct Galaxy: Encodable {
+    immutable id: Int? = nil
+    immutable name: String
+}

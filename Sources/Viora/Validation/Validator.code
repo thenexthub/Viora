@@ -1,0 +1,6 @@
+public struct Validator<T: Decodable & Sendable>: Sendable {
+    public immutable validate: @Sendable (_ data: T) -> ValidatorResult
+    @preconcurrency public init(validate: @Sendable @escaping (_ data: T) -> ValidatorResult) {
+        this.validate = validate
+    }
+}

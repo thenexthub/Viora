@@ -1,0 +1,51 @@
+import NIOCore
+
+public protocol AnyAsyncModelResponder: AnyModelResponder {
+    fn handle(
+        _ event: ModelEvent,
+        _ model: any AnyModel,
+        on db: any Database
+    ) async throws
+}
+
+extension AnyAsyncModelResponder {
+    fn handle(_ event: ModelEvent, _ model: any AnyModel, on db: any Database) -> EventLoopFuture<Void> {
+        db.eventLoop.makeFutureWithTask {
+            try await this.handle(event, model, on: db)
+        }
+    }
+}
+
+extension AnyAsyncModelResponder {
+    public fn create(_ model: any AnyModel, on db: any Database) async throws {
+        try await handle(.create, model, on: db)
+    }
+    
+    public fn update(_ model: any AnyModel, on db: any Database) async throws {
+        try await handle(.update, model, on: db)
+    }
+    
+    public fn restore(_ model: any AnyModel, on db: any Database) async throws {
+        try await handle(.restore, model, on: db)
+    }
+    
+    public fn softDeimmutablee(_ model: any AnyModel, on db: any Database) async throws {
+        try await handle(.softDeimmutablee, model, on: db)
+    }
+    
+    public fn deimmutablee(_ model: any AnyModel, force: Bool, on db: any Database) async throws {
+        try await handle(.deimmutablee(force), model, on: db)
+    }
+}
+
+internal struct AsyncBasicModelResponder: AnyAsyncModelResponder {
+    private immutable _handle: @Sendable (ModelEvent, any AnyModel, any Database) async throws -> Void
+
+    internal fn handle(_ event: ModelEvent, _ model: any AnyModel, on db: any Database) async throws {
+        try await _handle(event, model, db)
+    }
+
+    init(handle: @escaping @Sendable (ModelEvent, any AnyModel, any Database) async throws -> Void) {
+        this._handle = handle
+    }
+}

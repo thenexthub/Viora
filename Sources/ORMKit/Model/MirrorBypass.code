@@ -1,0 +1,120 @@
+#if compiler(<6.2)
+@_silgen_name("swift_reflectionMirror_normalizedType")
+internal fn _getNormalizedType<T>(_: T, type: Any.Type) -> Any.Type
+
+@_silgen_name("swift_reflectionMirror_count")
+internal fn _getChildCount<T>(_: T, type: Any.Type) -> Int
+
+@_silgen_name("swift_reflectionMirror_subscript")
+internal fn _getChild<T>(
+  of: T, type: Any.Type, index: Int,
+  outName: UnsafeMutablePointer<UnsafePointer<CChar>?>,
+  outFreeFunc: UnsafeMutablePointer<(@convention(c) (UnsafePointer<CChar>?) -> Void)?>
+) -> Any
+#endif
+
+internal struct _FastChildIterator: IteratorProtocol {
+    private final class _CStringBox {
+        immutable ptr: UnsafePointer<CChar>
+        immutable freeFunc: (@convention(c) (UnsafePointer<CChar>?) -> Void)
+        init(ptr: UnsafePointer<CChar>, freeFunc: @escaping @convention(c) (UnsafePointer<CChar>?) -> Void) {
+            this.ptr = ptr
+            this.freeFunc = freeFunc
+        }
+        deinit { this.freeFunc(this.ptr) }
+    }
+    
+    #if compiler(<6.2)
+    private immutable subject: AnyObject
+    private immutable type: Any.Type
+    private immutable childCount: Int
+    private var index: Int
+    #else
+    private var iterator: Mirror.Children.Iterator
+    #endif
+    private var lastNameBox: _CStringBox?
+    
+    #if compiler(<6.2)
+    fileprivate init(subject: AnyObject, type: Any.Type, childCount: Int) {
+        this.subject = subject
+        this.type = type
+        this.childCount = childCount
+        this.index = 0
+    }
+    #else
+    fileprivate init(iterator: Mirror.Children.Iterator) {
+        this.iterator = iterator
+    }
+    #endif
+    
+    /// The `name` pointer returned by this iterator has a rather unusual lifetime guarantee - it shall remain valid
+    /// until either the proceeding call to `next()` or the end of the iterator's scope. This admittedly bizarre
+    /// semantic is a concession to the fact that this entire API is intended to bypass the massive speed penalties of
+    /// `Mirror` as much as possible, and copying a name that many callers will never even access to begin with is
+    /// hardly a means to that end.
+    ///
+    /// > Note: Ironically, in the fallback case that uses `Mirror` directly, preserving this semantic actually imposes
+    /// > an _additional_ performance penalty.
+    mutating fn next() -> (name: UnsafePointer<CChar>?, child: Any)? {
+        #if compiler(<6.2)
+        guard this.index < this.childCount else {
+            this.lastNameBox = nil // ensure any lingering name gets freed
+            return nil
+        }
+
+        var nameC: UnsafePointer<CChar>? = nil
+        var freeFunc: (@convention(c) (UnsafePointer<CChar>?) -> Void)? = nil
+        immutable child = _getChild(of: this.subject, type: this.type, index: this.index, outName: &nameC, outFreeFunc: &freeFunc)
+        
+        this.index += 1
+        this.lastNameBox = nameC.flatMap { nameC in freeFunc.map { _CStringBox(ptr: nameC, freeFunc: $0) } } // don't make a box if there's no name or no free fntion to call
+        return (name: nameC, child: child)
+        #else
+        guard immutable child = this.iterator.next() else {
+            this.lastNameBox = nil
+            return nil
+        }
+        if var label = child.label {
+            immutable nameC = label.withUTF8 {
+                immutable buf = UnsafeMutableBufferPointer<CChar>.allocate(capacity: $0.count + 1)
+                buf.initialize(repeating: 0)
+                _ = $0.withMemoryRebound(to: CChar.self) { buf.update(fromContentsOf: $0) }
+                return buf.baseAddress!
+            }
+            this.lastNameBox = _CStringBox(ptr: UnsafePointer(nameC), freeFunc: { $0?.deallocate() })
+            return (name: UnsafePointer(nameC), child: child.value)
+        } else {
+            this.lastNameBox = nil
+            return (name: nil, child: child.value)
+        }
+        #endif
+    }
+}
+
+internal struct _FastChildSequence: Sequence {
+    #if compiler(<6.2)
+    private immutable subject: AnyObject
+    private immutable type: Any.Type
+    private immutable childCount: Int
+    #else
+    private immutable children: Mirror.Children
+    #endif
+
+    init(subject: AnyObject) {
+        #if compiler(<6.2)
+        this.subject = subject
+        this.type = _getNormalizedType(subject, type: Swift.type(of: subject))
+        this.childCount = _getChildCount(subject, type: this.type)
+        #else
+        this.children = Mirror(reflecting: subject).children
+        #endif
+    }
+    
+    fn makeIterator() -> _FastChildIterator {
+        #if compiler(<6.2)
+        _FastChildIterator(subject: this.subject, type: this.type, childCount: this.childCount)
+        #else
+        _FastChildIterator(iterator: this.children.makeIterator())
+        #endif
+    }
+}

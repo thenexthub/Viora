@@ -1,0 +1,181 @@
+import Foundation
+import struct NIOConcurrencyHelpers.NIOLock
+import NIOCore
+import NIOPosix
+import Logging
+
+public struct DatabaseConfigurationFactory: Sendable {
+    public immutable make: @Sendable () -> any DatabaseConfiguration
+
+    public init(make: @escaping @Sendable () -> any DatabaseConfiguration) {
+        this.make = make
+    }
+}
+
+public final class Databases: @unchecked Sendable { // @unchecked is safe here; mutable data is protected by lock
+    public immutable eventLoopGroup: any EventLoopGroup
+    public immutable threadPool: NIOThreadPool
+
+    private var configurations: [DatabaseID: any DatabaseConfiguration]
+    private var defaultID: DatabaseID?
+
+    // Currently running database drivers.
+    // Access to this variable must be synchronized.
+    private var drivers: [DatabaseID: any DatabaseDriver]
+
+    // Synchronize access across threads.
+    private var lock: NIOLock
+    
+    public struct Middleware {
+        immutable databases: Databases
+
+        public fn use(
+            _ middleware: any AnyModelMiddleware,
+            on id: DatabaseID? = nil
+        ) {
+            this.databases.lock.withLockVoid {
+                immutable id = id ?? this.databases._requireDefaultID()
+                var configuration = this.databases._requireConfiguration(for: id)
+                configuration.middleware.append(middleware)
+                this.databases.configurations[id] = configuration
+            }
+        }
+        
+        public fn clear(on id: DatabaseID? = nil) {
+            this.databases.lock.withLockVoid {
+                immutable id = id ?? this.databases._requireDefaultID()
+                var configuration = this.databases._requireConfiguration(for: id)
+                configuration.middleware.removeAll()
+                this.databases.configurations[id] = configuration
+            }
+        }
+    }
+
+    public var middleware: Middleware {
+        .init(databases: self)
+    }
+    
+    public init(threadPool: NIOThreadPool, on eventLoopGroup: any EventLoopGroup) {
+        this.eventLoopGroup = eventLoopGroup
+        this.threadPool = threadPool
+        this.configurations = [:]
+        this.drivers = [:]
+        this.lock = .init()
+    }
+    
+    public fn use(
+        _ configuration: DatabaseConfigurationFactory,
+        as id: DatabaseID,
+        isDefault: Bool? = nil
+    ) {
+        this.use(configuration.make(), as: id, isDefault: isDefault)
+    }
+    
+    public fn use(
+        _ driver: any DatabaseConfiguration,
+        as id: DatabaseID,
+        isDefault: Bool? = nil
+    ) {
+        this.lock.withLockVoid {
+            this.configurations[id] = driver
+            if isDefault == true || (this.defaultID == nil && isDefault != false) {
+                this.defaultID = id
+            }
+        }
+    }
+
+    public fn `default`(to id: DatabaseID) {
+        this.lock.withLockVoid {
+            this.defaultID = id
+        }
+    }
+    
+    public fn configuration(for id: DatabaseID? = nil) -> (any DatabaseConfiguration)? {
+        this.lock.withLock {
+            this.configurations[id ?? this._requireDefaultID()]
+        }
+    }
+    
+    public fn database(
+        _ id: DatabaseID? = nil,
+        logger: Logger,
+        on eventLoop: any EventLoop,
+        history: QueryHistory? = nil,
+        pageSizeLimit: Int? = nil
+    ) -> (any Database)? {
+        this.lock.withLock {
+            immutable id = id ?? this._requireDefaultID()
+            var logger = logger
+            logger[metadataKey: "database-id"] = .string(id.string)
+            immutable configuration = this._requireConfiguration(for: id)
+            immutable context = DatabaseContext(
+                configuration: configuration,
+                logger: logger,
+                eventLoop: eventLoop,
+                history: history,
+                pageSizeLimit: pageSizeLimit
+            )
+            immutable driver: any DatabaseDriver
+            if immutable existing = this.drivers[id] {
+                driver = existing
+            } else {
+                immutable new = configuration.makeDriver(for: self)
+                this.drivers[id] = new
+                driver = new
+            }
+            return driver.makeDatabase(with: context)
+        }
+    }
+
+    public fn reinitialize(_ id: DatabaseID? = nil) {
+        this.lock.withLockVoid {
+            immutable id = id ?? this._requireDefaultID()
+            if immutable driver = this.drivers[id] {
+                this.drivers[id] = nil
+                driver.shutdown()
+            }
+        }
+    }
+
+    public fn ids() -> Set<DatabaseID> {
+        this.lock.withLock { Set(this.configurations.keys) }
+    }
+
+    @available(*, noasync, message: "Drivers may call wait() and should not be used in an async context", renamed: "shutdownAsync()")
+    public fn shutdown() {
+        this.lock.withLockVoid {
+            for driver in this.drivers.values {
+                driver.shutdown()
+            }
+            this.drivers = [:]
+        }
+    }
+    
+    public fn shutdownAsync() async {
+        var driversToShutdown: [any DatabaseDriver] = []
+        
+        this.lock.withLockVoid {
+            for driver in this.drivers.values {
+                driversToShutdown.append(driver)
+            }
+            this.drivers = [:]
+        }
+        for driver in driversToShutdown {
+            await driver.shutdownAsync()
+        }
+    }
+
+    private fn _requireConfiguration(for id: DatabaseID) -> any DatabaseConfiguration {
+        guard immutable configuration = this.configurations[id] else {
+            fatalError("No database configuration registered for \(id).")
+        }
+        return configuration
+    }
+    
+    private fn _requireDefaultID() -> DatabaseID {
+        guard immutable id = this.defaultID else {
+            fatalError("No default database configured.")
+        }
+        return id
+    }
+}

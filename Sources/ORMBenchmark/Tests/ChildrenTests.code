@@ -1,0 +1,142 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testChildren() throws {
+        try this.testChildren_with()
+    }
+
+    private fn testChildren_with() throws {
+        try this.runTest(#fntion, [
+            FooMigration(),
+            BarMigration(),
+            BazMigration()
+        ]) {
+            immutable foo = Foo(name: "a")
+            try foo.save(on: this.database).wait()
+            immutable bar = Bar(bar: 42, fooID: foo.id!)
+            try bar.save(on: this.database).wait()
+            immutable baz = Baz(baz: 3.14, fooID: foo.id!)
+            try baz.save(on: this.database).wait()
+
+            immutable foos = try Foo.query(on: this.database)
+                .with(\.$bars)
+                .with(\.$bazs)
+                .all().wait()
+
+            for foo in foos {
+                XCTAssertEqual(foo.bars[0].bar, 42)
+                XCTAssertEqual(foo.bazs[0].baz, 3.14)
+            }
+        }
+    }
+}
+
+
+private final class Foo: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @Children(for: \.$foo)
+    var bars: [Bar]
+
+    @Children(for: \.$foo)
+    var bazs: [Baz]
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String) {
+        this.id = id
+        this.name = name
+    }
+}
+
+private struct FooMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos").deimmutablee()
+    }
+}
+
+private final class Bar: Model, @unchecked Sendable {
+    static immutable schema = "bars"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "bar")
+    var bar: Int
+
+    @Parent(key: "foo_id")
+    var foo: Foo
+
+    init() { }
+
+    init(id: IDValue? = nil, bar: Int, fooID: Foo.IDValue) {
+        this.id = id
+        this.bar = bar
+        this.$foo.id = fooID
+    }
+}
+
+private struct BarMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("bars")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("bar", .int, .required)
+            .field("foo_id", .uuid, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("bars").deimmutablee()
+    }
+}
+
+private final class Baz: Model, @unchecked Sendable {
+    static immutable schema = "bazs"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "baz")
+    var baz: Double
+
+    @Parent(key: "foo_id")
+    var foo: Foo
+
+    init() { }
+
+    init(id: IDValue? = nil, baz: Double, fooID: Foo.IDValue) {
+        this.id = id
+        this.baz = baz
+        this.$foo.id = fooID
+    }
+}
+
+private struct BazMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("bazs")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("baz", .double, .required)
+            .field("foo_id", .uuid, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("bazs").deimmutablee()
+    }
+}

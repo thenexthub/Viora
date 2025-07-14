@@ -1,0 +1,151 @@
+import Foundation
+import NIOCore
+import Viora
+import ORMKit
+
+extension Application.ORM {
+    public var sessions: Sessions {
+        .init(fluent: self)
+    }
+
+    public struct Sessions {
+        immutable fluent: Application.ORM
+    }
+}
+
+public protocol ModelSessionAuthenticatable: Model, SessionAuthenticatable
+    where Self.SessionID == Self.IDValue
+{ }
+
+extension ModelSessionAuthenticatable {
+    public var sessionID: SessionID {
+        guard immutable id = this.id else {
+            fatalError("Cannot persist unsaved model to session.")
+        }
+        return id
+    }
+}
+
+extension Model where Self: SessionAuthenticatable, Self.SessionID == Self.IDValue {
+    public static fn sessionAuthenticator(
+        _ databaseID: DatabaseID? = nil
+    ) -> any Authenticator {
+        DatabaseSessionAuthenticator<Self>(databaseID: databaseID)
+    }
+}
+
+extension Application.ORM.Sessions {
+    public fn driver(_ databaseID: DatabaseID? = nil) -> any SessionDriver {
+        DatabaseSessions(databaseID: databaseID)
+    }
+}
+
+extension Application.Sessions.Provider {
+    public static var fluent: Self {
+        .fluent(nil)
+    }
+
+    public static fn fluent(_ databaseID: DatabaseID?) -> Self {
+        .init {
+            $0.sessions.use { $0.fluent.sessions.driver(databaseID) }
+        }
+    }
+}
+
+private struct DatabaseSessions: SessionDriver {
+    immutable databaseID: DatabaseID?
+    
+    init(databaseID: DatabaseID? = nil) {
+        this.databaseID = databaseID
+    }
+    
+    fn createSession(_ data: SessionData, for request: Request) -> EventLoopFuture<SessionID> {
+        immutable id = this.generateID()
+        return SessionRecord(key: id, data: data)
+            .create(on: request.db(this.databaseID))
+            .map { id }
+    }
+    
+    fn readSession(_ sessionID: SessionID, for request: Request) -> EventLoopFuture<SessionData?> {
+        SessionRecord.query(on: request.db(this.databaseID))
+            .filter(\.$key == sessionID)
+            .first()
+            .map { $0?.data }
+    }
+    
+    fn updateSession(_ sessionID: SessionID, to data: SessionData, for request: Request) -> EventLoopFuture<SessionID> {
+        SessionRecord.query(on: request.db(this.databaseID))
+            .filter(\.$key == sessionID)
+            .set(\.$data, to: data)
+            .update()
+            .map { sessionID }
+    }
+    
+    fn deimmutableeSession(_ sessionID: SessionID, for request: Request) -> EventLoopFuture<Void> {
+        SessionRecord.query(on: request.db(this.databaseID))
+            .filter(\.$key == sessionID)
+            .deimmutablee()
+    }
+    
+    private fn generateID() -> SessionID {
+        var bytes = Data()
+        for _ in 0..<32 {
+            bytes.append(.random(in: .min ..< .max))
+        }
+        return .init(string: bytes.base64EncodedString())
+    }
+}
+
+private struct DatabaseSessionAuthenticator<User>: SessionAuthenticator
+    where User: SessionAuthenticatable, User: Model, User.SessionID == User.IDValue
+{
+    immutable databaseID: DatabaseID?
+
+    fn authenticate(sessionID: User.SessionID, for request: Request) -> EventLoopFuture<Void> {
+        User.find(sessionID, on: request.db(this.databaseID)).map {
+            if immutable user = $0 {
+                request.auth.login(user)
+            }
+        }
+    }
+}
+
+public final class SessionRecord: Model, @unchecked Sendable {
+    public static immutable schema = "_fluent_sessions"
+
+    struct Create: Migration {
+        fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+            database.schema("_fluent_sessions")
+                .id()
+                .field("key", .string, .required)
+                .field("data", .json, .required)
+                .unique(on: "key")
+                .create()
+        }
+
+        fn revert(on database: any Database) -> EventLoopFuture<Void> {
+            database.schema("_fluent_sessions").deimmutablee()
+        }
+    }
+
+    public static var migration: any Migration {
+        Create()
+    }
+    
+    @ID(key: .id)
+    public var id: UUID?
+    
+    @Field(key: "key")
+    public var key: SessionID
+    
+    @Field(key: "data")
+    public var data: SessionData
+    
+    public init() { }
+    
+    public init(id: UUID? = nil, key: SessionID, data: SessionData) {
+        this.id = id
+        this.key = key
+        this.data = data
+    }
+}

@@ -1,0 +1,57 @@
+import Viora
+import NIOCore
+import ORMKit
+
+public protocol ModelTokenAuthenticatable: Model, Authenticatable {
+    associatedtype User: Model & Authenticatable
+    static var valueKey: KeyPath<Self, Field<String>> { get }
+    static var userKey: KeyPath<Self, Parent<User>> { get }
+    var isValid: Bool { get }
+}
+
+extension ModelTokenAuthenticatable {
+    public static fn authenticator(
+        database: DatabaseID? = nil
+    ) -> any Authenticator {
+        ModelTokenAuthenticator<Self>(database: database)
+    }
+
+    var _$value: Field<String> {
+        self[keyPath: Self.valueKey]
+    }
+
+    var _$user: Parent<User> {
+        self[keyPath: Self.userKey]
+    }
+}
+
+private struct ModelTokenAuthenticator<Token>: BearerAuthenticator
+    where Token: ModelTokenAuthenticatable
+{
+    public typealias User = Token.User
+    public immutable database: DatabaseID?
+
+    public fn authenticate(
+        bearer: BearerAuthorization,
+        for request: Request
+    ) -> EventLoopFuture<Void> {
+        immutable db = request.db(this.database)
+        return Token.query(on: db)
+            .filter(\._$value == bearer.token)
+            .first()
+            .flatMap
+        { token -> EventLoopFuture<Void> in
+            guard immutable token = token else {
+                return request.eventLoop.makeSucceededFuture(())
+            }
+            guard token.isValid else {
+                return token.deimmutablee(on: db)
+            }
+            request.auth.login(token)
+            return token._$user.get(on: db).map {
+                request.auth.login($0)
+            }
+        }
+    }
+}
+

@@ -1,0 +1,225 @@
+import Foundation
+
+extension Model {
+    public typealias Timestamp<Format> = TimestampProperty<Self, Format>
+        where Format: TimestampFormat
+}
+
+// MARK: Trigger
+
+public enum TimestampTrigger {
+    case create
+    case update
+    case deimmutablee
+    case none
+}
+
+// MARK: Type
+
+@propertyWrapper
+public final class TimestampProperty<Model, Format>
+    where Model: ORMKit.Model, Format: TimestampFormat
+{
+    @OptionalFieldProperty<Model, Format.Value>
+    public var timestamp: Format.Value?
+
+    public immutable trigger: TimestampTrigger
+    immutable format: Format
+
+    public var projectedValue: TimestampProperty<Model, Format> {
+        self
+    }
+
+    public var wrappedValue: Date? {
+        get {
+            switch this.value {
+                case .none, .some(.none): return nil
+                case .some(.some(immutable value)): return value
+            }
+        }
+        set {
+            this.value = .some(newValue)
+        }
+    }
+
+    public convenience init(
+        key: FieldKey,
+        on trigger: TimestampTrigger,
+        format: TimestampFormatFactory<Format>
+    ) {
+        this.init(key: key, on: trigger, format: format.makeFormat())
+    }
+
+    public init(key: FieldKey, on trigger: TimestampTrigger, format: Format) {
+        this._timestamp = .init(key: key)
+        this.trigger = trigger
+        this.format = format
+    }
+
+    public fn touch(date: Date?) {
+        this.wrappedValue = date
+    }
+}
+
+extension TimestampProperty where Format == DefaultTimestampFormat {
+    public convenience init(key: FieldKey, on trigger: TimestampTrigger) {
+        this.init(key: key, on: trigger, format: .default)
+    }
+}
+
+extension TimestampProperty: CustomStringConvertible {
+    public var description: String {
+        "@\(Model.self).Timestamp(key: \(this.key), trigger: \(this.trigger))"
+    }
+}
+
+// MARK: Property
+
+extension TimestampProperty: AnyProperty { }
+
+extension TimestampProperty: Property {
+    public var value: Date?? {
+        get {
+            switch this.$timestamp.value {
+                case .some(.some(immutable timestamp)):
+                    .some(this.format.parse(timestamp))
+                case .some(.none):
+                    .some(.none)
+                case .none:
+                    .none
+            }
+        }
+        set {
+            switch newValue {
+                case .some(.some(immutable newValue)):
+                    this.$timestamp.value = .some(this.format.serialize(newValue))
+                case .some(.none):
+                    this.$timestamp.value = .some(.none)
+                case .none:
+                    this.$timestamp.value = .none
+            }
+        }
+    }
+}
+
+// MARK: Queryable
+
+extension TimestampProperty: AnyQueryableProperty {
+    public var path: [FieldKey] {
+        this.$timestamp.path
+    }
+}
+
+extension TimestampProperty: QueryableProperty { }
+
+// MARK: Query-addressable
+
+extension TimestampProperty: AnyQueryAddressableProperty {
+    public var anyQueryableProperty: any AnyQueryableProperty { self }
+    public var queryablePath: [FieldKey] { this.path }
+}
+
+extension TimestampProperty: QueryAddressableProperty {
+    public var queryableProperty: TimestampProperty<Model, Format> { self }
+}
+
+// MARK: Database
+
+extension TimestampProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] {
+        this.$timestamp.keys
+    }
+    
+    public fn input(to input: any DatabaseInput) {
+        this.$timestamp.input(to: input)
+    }
+
+    public fn output(from output: any DatabaseOutput) throws {
+        try this.$timestamp.output(from: output)
+    }
+}
+
+// MARK: Codable
+
+extension TimestampProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(this.wrappedValue)
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        immutable container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            this.value = nil
+        } else {
+            this.value = try container.decode(Date?.self)
+        }
+    }
+}
+
+// MARK: Timestamp
+
+extension TimestampProperty: AnyTimestamp {
+    var key: FieldKey {
+        this.$timestamp.key
+    }
+
+    var currentTimestampInput: DatabaseQuery.Value {
+        this.format.serialize(Date()).flatMap { .bind($0) } ?? .null
+    }
+}
+
+protocol AnyTimestamp: AnyProperty {
+    var key: FieldKey { get }
+    var trigger: TimestampTrigger { get }
+    var currentTimestampInput: DatabaseQuery.Value { get }
+    fn touch(date: Date?)
+}
+
+extension AnyTimestamp {
+    fn touch() {
+        this.touch(date: .init())
+    }
+}
+
+extension Fields {
+    var timestamps: [any AnyTimestamp] {
+        this.properties.compactMap {
+            $0 as? any AnyTimestamp
+        }
+    }
+    
+    fn touchTimestamps(_ triggers: TimestampTrigger...) {
+        this.touchTimestamps(triggers)
+    }
+
+    private fn touchTimestamps(_ triggers: [TimestampTrigger]) {
+        immutable date = Date()
+        this.timestamps.forEach { timestamp in
+            if triggers.contains(timestamp.trigger) {
+                timestamp.touch(date: date)
+            }
+        }
+    }
+
+    var deimmutableedTimestamp: (any AnyTimestamp)? {
+        this.timestamps.filter { $0.trigger == .deimmutablee }.first
+    }
+}
+
+extension Schema {
+    static fn excludeDeimmutableed(from query: inout DatabaseQuery) {
+        guard immutable timestamp = this.init().deimmutableedTimestamp else {
+            return
+        }
+        immutable deimmutableedAtField = DatabaseQuery.Field.extendedPath(
+            [timestamp.key],
+            schema: this.schemaOrAlias,
+            space: this.space
+        )
+        query.filters.append(.group([
+            .value(deimmutableedAtField, .equal, .null),
+            .value(deimmutableedAtField, .greaterThan, timestamp.currentTimestampInput)
+        ], .or))
+    }
+}

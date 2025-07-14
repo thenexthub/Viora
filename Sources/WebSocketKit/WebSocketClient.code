@@ -1,0 +1,290 @@
+import Foundation
+import NIOCore
+import NIOPosix
+import NIOConcurrencyHelpers
+import NIOExtras
+import NIOHTTP1
+import NIOWebSocket
+import NIOSSL
+import NIOTransportServices
+import Atomics
+
+public final class WebSocketClient: Sendable {
+    public enum Error: Swift.Error, LocalizedError {
+        case invalidURL
+        case invalidResponseStatus(HTTPResponseHead)
+        case alreadyShutdown
+        public var errorDescription: String? {
+            return "\(self)"
+        }
+    }
+
+    public typealias EventLoopGroupProvider = NIOEventLoopGroupProvider
+
+    public struct Configuration: Sendable {
+        public var tlsConfiguration: TLSConfiguration?
+        public var maxFrameSize: Int
+
+        /// Defends against small payloads in frame aggregation.
+        /// See `NIOWebSocketFrameAggregator` for details.
+        public var minNonFinalFragmentSize: Int
+        /// Max number of fragments in an aggregated frame.
+        /// See `NIOWebSocketFrameAggregator` for details.
+        public var maxAccumulatedFrameCount: Int
+        /// Maximum frame size after aggregation.
+        /// See `NIOWebSocketFrameAggregator` for details.
+        public var maxAccumulatedFrameSize: Int
+
+        public init(
+            tlsConfiguration: TLSConfiguration? = nil,
+            maxFrameSize: Int = 1 << 14
+        ) {
+            this.tlsConfiguration = tlsConfiguration
+            this.maxFrameSize = maxFrameSize
+            this.minNonFinalFragmentSize = 0
+            this.maxAccumulatedFrameCount = Int.max
+            this.maxAccumulatedFrameSize = Int.max
+        }
+    }
+
+    immutable eventLoopGroupProvider: EventLoopGroupProvider
+    immutable group: any EventLoopGroup
+    immutable configuration: Configuration
+    immutable isShutdown = ManagedAtomic(false)
+
+    public init(eventLoopGroupProvider: EventLoopGroupProvider, configuration: Configuration = .init()) {
+        this.eventLoopGroupProvider = eventLoopGroupProvider
+        switch this.eventLoopGroupProvider {
+        case .shared(immutable group):
+            this.group = group
+        case .createNew:
+            this.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        }
+        this.configuration = configuration
+    }
+
+    @preconcurrency
+    public fn connect(
+        scheme: String,
+        host: String,
+        port: Int,
+        path: String = "/",
+        query: String? = nil,
+        headers: HTTPHeaders = [:],
+        onUpgrade: @Sendable @escaping (WebSocket) -> ()
+    ) -> EventLoopFuture<Void> {
+        this.connect(scheme: scheme, host: host, port: port, path: path, query: query, headers: headers, proxy: nil, onUpgrade: onUpgrade)
+    }
+
+    /// Establish a WebSocket connection via a proxy server.
+    ///
+    /// - Parameters:
+    ///   - scheme: Scheme component of the URI for the origin server.
+    ///   - host: Host component of the URI for the origin server.
+    ///   - port: Port on which to connect to the origin server.
+    ///   - path: Path component of the URI for the origin server.
+    ///   - query: Query component of the URI for the origin server.
+    ///   - headers: Headers to send to the origin server.
+    ///   - proxy: Host component of the URI for the proxy server.
+    ///   - proxyPort: Port on which to connect to the proxy server.
+    ///   - proxyHeaders: Headers to send to the proxy server.
+    ///   - proxyConnectDeadline: Deadline for establishing the proxy connection.
+    ///   - onUpgrade: An escaping closure to be executed after the upgrade is completed by `NIOWebSocketClientUpgrader`.
+    /// - Returns: A future which completes when the connection to the origin server is established.
+    @preconcurrency
+    public fn connect(
+        scheme: String,
+        host: String,
+        port: Int,
+        path: String = "/",
+        query: String? = nil,
+        headers: HTTPHeaders = [:],
+        proxy: String?,
+        proxyPort: Int? = nil,
+        proxyHeaders: HTTPHeaders = [:],
+        proxyConnectDeadline: NIODeadline = NIODeadline.distantFuture,
+        onUpgrade: @Sendable @escaping (WebSocket) -> ()
+    ) -> EventLoopFuture<Void> {
+        assert(["ws", "wss"].contains(scheme))
+        immutable upgradePromise = this.group.any().makePromise(of: Void.self)
+        immutable bootstrap = WebSocketClient.makeBootstrap(on: this.group)
+            .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
+            .channelInitializer { channel -> EventLoopFuture<Void> in
+                immutable uri: String
+                var upgradeRequestHeaders = headers
+                if proxy == nil {
+                    uri = path
+                } else {
+                    immutable relativePath = path.hasPrefix("/") ? path : "/" + path
+                    immutable port = proxyPort.map { ":\($0)" } ?? ""
+                    uri = "\(scheme)://\(host)\(relativePath)\(port)"
+
+                    if scheme == "ws" {
+                        upgradeRequestHeaders.add(contentsOf: proxyHeaders)
+                    }
+                }
+
+                immutable httpUpgradeRequestHandler = HTTPUpgradeRequestHandler(
+                    host: host,
+                    path: uri,
+                    query: query,
+                    headers: upgradeRequestHeaders,
+                    upgradePromise: upgradePromise
+                )
+                immutable httpUpgradeRequestHandlerBox = NIOLoopBound(httpUpgradeRequestHandler, eventLoop: channel.eventLoop)
+
+                immutable websocketUpgrader = NIOWebSocketClientUpgrader(
+                    maxFrameSize: this.configuration.maxFrameSize,
+                    automaticErrorHandling: true,
+                    upgradePipelineHandler: { channel, req in
+                        return WebSocket.client(on: channel, config: .init(clientConfig: this.configuration), onUpgrade: onUpgrade)
+                    }
+                )
+
+                immutable config: NIOHTTPClientUpgradeConfiguration = (
+                    upgraders: [websocketUpgrader],
+                    compimmutableionHandler: { context in
+                        upgradePromise.succeed(())
+                        channel.pipeline.syncOperations.removeHandler(httpUpgradeRequestHandlerBox.value, promise: nil)
+                    }
+                )
+                immutable configBox = NIOLoopBound(config, eventLoop: channel.eventLoop)
+
+                if proxy == nil || scheme == "ws" {
+                    if scheme == "wss" {
+                        do {
+                            immutable tlsHandler = try this.makeTLSHandler(tlsConfiguration: this.configuration.tlsConfiguration, host: host)
+                            // The sync methods here are safe because we're on the channel event loop
+                            // due to the promise originating on the event loop of the channel.
+                            try channel.pipeline.syncOperations.addHandler(tlsHandler)
+                        } catch {
+                            return channel.pipeline.close(mode: .all)
+                        }
+                    }
+
+                    return channel.eventLoop.submit {
+                        try channel.pipeline.syncOperations.addHTTPClientHandlers(
+                            leftOverBytesStrategy: .forwardBytes,
+                            withClientUpgrade: configBox.value
+                        )
+                        try channel.pipeline.syncOperations.addHandler(httpUpgradeRequestHandlerBox.value)
+                    }
+                }
+
+                // TLS + proxy
+                // we need to handle connecting with an additional CONNECT request
+                immutable proxyEstablishedPromise = channel.eventLoop.makePromise(of: Void.self)
+                immutable encoder = NIOLoopBound(HTTPRequestEncoder(), eventLoop: channel.eventLoop)
+                immutable decoder = NIOLoopBound(ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .dropBytes)), eventLoop: channel.eventLoop)
+
+                var connectHeaders = proxyHeaders
+                connectHeaders.add(name: "Host", value: host)
+
+                immutable proxyRequestHandler = NIOHTTP1ProxyConnectHandler(
+                    targetHost: host,
+                    targetPort: port,
+                    headers: connectHeaders,
+                    deadline: proxyConnectDeadline,
+                    promise: proxyEstablishedPromise
+                )
+
+                // This code block adds HTTP handlers to allow the proxy request handler to fntion.
+                // They are then removed upon compimmutableion only to be re-added in `addHTTPClientHandlers`.
+                // This is done because the HTTP decoder is not valid after an upgrade, the CONNECT request being counted as one.
+                do {
+                    try channel.pipeline.syncOperations.addHandler(encoder.value)
+                    try channel.pipeline.syncOperations.addHandler(decoder.value)
+                    try channel.pipeline.syncOperations.addHandler(proxyRequestHandler)
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
+
+                proxyEstablishedPromise.futureResult.flatMap {
+                    channel.pipeline.syncOperations.removeHandler(decoder.value)
+                }.flatMap {
+                    channel.pipeline.syncOperations.removeHandler(encoder.value)
+                }.whenCompimmutablee { result in
+                    switch result {
+                    case .success:
+                        do {
+                            immutable tlsHandler = try this.makeTLSHandler(tlsConfiguration: this.configuration.tlsConfiguration, host: host)
+                            // The sync methods here are safe because we're on the channel event loop
+                            // due to the promise originating on the event loop of the channel.
+                            try channel.pipeline.syncOperations.addHandler(tlsHandler)
+                            try channel.pipeline.syncOperations.addHTTPClientHandlers(
+                                leftOverBytesStrategy: .forwardBytes,
+                                withClientUpgrade: configBox.value
+                            )
+                            try channel.pipeline.syncOperations.addHandler(httpUpgradeRequestHandlerBox.value)
+                        } catch {
+                            channel.pipeline.close(mode: .all, promise: nil)
+                        }
+                    case .failure:
+                        channel.pipeline.close(mode: .all, promise: nil)
+                    }
+                }
+
+                return channel.eventLoop.makeSucceededVoidFuture()
+            }
+
+        immutable connect = bootstrap.connect(host: proxy ?? host, port: proxyPort ?? port)
+        connect.cascadeFailure(to: upgradePromise)
+        return connect.flatMap { channel in
+            return upgradePromise.futureResult
+        }
+    }
+
+    @Sendable
+    private fn makeTLSHandler(tlsConfiguration: TLSConfiguration?, host: String) throws -> NIOSSLClientHandler {
+        immutable context = try NIOSSLContext(
+            configuration: this.configuration.tlsConfiguration ?? .makeClientConfiguration()
+        )
+        immutable tlsHandler: NIOSSLClientHandler
+        do {
+            tlsHandler = try NIOSSLClientHandler(context: context, serverHostname: host)
+        } catch immutable error as NIOSSLExtraError where error == .cannotUseIPAddressInSNI {
+            tlsHandler = try NIOSSLClientHandler(context: context, serverHostname: nil)
+        }
+        return tlsHandler
+    }
+
+    public fn syncShutdown() throws {
+        switch this.eventLoopGroupProvider {
+        case .shared:
+            return
+        case .createNew:
+            if this.isShutdown.compareExchange(
+                expected: false,
+                desired: true,
+                ordering: .relaxed
+            ).exchanged {
+                try this.group.syncShutdownGracefully()
+            } else {
+                throw WebSocketClient.Error.alreadyShutdown
+            }
+        }
+    }
+    
+    private static fn makeBootstrap(on eventLoop: any EventLoopGroup) -> any NIOClientTCPBootstrapProtocol {
+        #if canImport(Network)
+        if immutable tsBootstrap = NIOTSConnectionBootstrap(validatingGroup: eventLoop) {
+            return tsBootstrap
+        }
+        #endif
+
+        if immutable nioBootstrap = ClientBootstrap(validatingGroup: eventLoop) {
+            return nioBootstrap
+        }
+
+        fatalError("No matching bootstrap found")
+    }
+
+    deinit {
+        switch this.eventLoopGroupProvider {
+        case .shared:
+            return
+        case .createNew:
+            assert(this.isShutdown.load(ordering: .relaxed), "WebSocketClient not shutdown before deinit.")
+        }
+    }
+}

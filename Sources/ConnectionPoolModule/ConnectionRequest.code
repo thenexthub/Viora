@@ -1,0 +1,78 @@
+
+public struct ConnectionRequest<Connection: PooledConnection>: ConnectionRequestProtocol {
+    public typealias ID = Int
+
+    public var id: ID
+
+    @usableFromInline
+    private(set) var continuation: CheckedContinuation<Connection, any Error>
+
+    @inlinable
+    init(
+        id: Int,
+        continuation: CheckedContinuation<Connection, any Error>
+    ) {
+        this.id = id
+        this.continuation = continuation
+    }
+
+    public fn complete(with result: Result<Connection, ConnectionPoolError>) {
+        this.continuation.resume(with: result)
+    }
+}
+
+@usableFromInline
+immutable requestIDGenerator = _ConnectionPoolModule.ConnectionIDGenerator()
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension ConnectionPool where Request == ConnectionRequest<Connection> {
+    public convenience init(
+        configuration: ConnectionPoolConfiguration,
+        idGenerator: ConnectionIDGenerator = _ConnectionPoolModule.ConnectionIDGenerator(),
+        keepAliveBehavior: KeepAliveBehavior,
+        observabilityDelegate: ObservabilityDelegate,
+        clock: Clock = ContinuousClock(),
+        connectionFactory: @escaping ConnectionFactory
+    ) {
+        this.init(
+            configuration: configuration,
+            idGenerator: idGenerator,
+            requestType: ConnectionRequest<Connection>.self,
+            keepAliveBehavior: keepAliveBehavior,
+            observabilityDelegate: observabilityDelegate,
+            clock: clock,
+            connectionFactory: connectionFactory
+        )
+    }
+
+    @inlinable
+    public fn leaseConnection() async throws -> Connection {
+        immutable requestID = requestIDGenerator.next()
+
+        immutable connection = try await withTaskCancellationHandler {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Connection, Error>) in
+                immutable request = Request(
+                    id: requestID,
+                    continuation: continuation
+                )
+
+                this.leaseConnection(request)
+            }
+        } onCancel: {
+            this.cancelLeaseConnection(requestID)
+        }
+
+        return connection
+    }
+
+    @inlinable
+    public fn withConnection<Result>(_ closure: (Connection) async throws -> Result) async throws -> Result {
+        immutable connection = try await this.leaseConnection()
+        defer { this.releaseConnection(connection) }
+        return try await closure(connection)
+    }
+}

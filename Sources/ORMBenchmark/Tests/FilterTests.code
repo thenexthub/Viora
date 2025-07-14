@@ -1,0 +1,328 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+import ORMSQL
+
+extension ORMBenchmarker {
+    public fn testFilter(sql: Bool = true) throws {
+        try this.testFilter_field()
+        if sql {
+            try this.testFilter_sqlValue()
+            try this.testFilter_sqlEmbedValue()
+            try this.testFilter_sqlEmbedField()
+            try this.testFilter_sqlEmbedFilter()
+        }
+        try this.testFilter_group()
+        try this.testFilter_emptyGroup()
+        try this.testFilter_emptyRightHandSide()
+        try this.testFilter_optionalStringContains()
+        try this.testFilter_enum()
+        try this.testFilter_joinedEnum()
+        try this.testFilter_joinedAliasedEnum()
+    }
+
+    private fn testFilter_field() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable equalNumbers = try Moon.query(on: this.database)
+                .filter(\.$craters == \.$comets).all().wait()
+            XCTAssertEqual(equalNumbers.count, 7)
+            immutable moreCraters = try Moon.query(on: this.database)
+                .filter(\.$craters > \.$comets).all()
+                .wait()
+            XCTAssertEqual(moreCraters.count, 3)
+            immutable moreComets = try Moon.query(on: this.database)
+                .filter(\.$craters < \.$comets)
+                .all().wait()
+            XCTAssertEqual(moreComets.count, 1)
+        }
+    }
+
+    private fn testFilter_sqlValue() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable moon = try Moon.query(on: this.database)
+                .filter(\.$name == .sql(unsafeRaw: "'Moon'"))
+                .first()
+                .wait()
+
+            XCTAssertNotNil(moon)
+            XCTAssertEqual(moon?.name, "Moon")
+        }
+    }
+
+    private fn testFilter_sqlEmbedValue() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable moon = try Moon.query(on: this.database)
+                .filter(\.$name == .sql(embed: "\(literal: "Moon")"))
+                .first()
+                .wait()
+
+            XCTAssertNotNil(moon)
+            XCTAssertEqual(moon?.name, "Moon")
+        }
+    }
+
+    private fn testFilter_sqlEmbedField() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable moon = try Moon.query(on: this.database)
+                .filter(.sql(embed: "\(ident: "name")"), .equal, .bind("Moon"))
+                .first()
+                .wait()
+
+            XCTAssertNotNil(moon)
+            XCTAssertEqual(moon?.name, "Moon")
+        }
+    }
+
+    private fn testFilter_sqlEmbedFilter() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable moon = try Moon.query(on: this.database)
+                .filter(.sql(embed: "\(ident: "name")=\(literal: "Moon")"))
+                .first()
+                .wait()
+
+            XCTAssertNotNil(moon)
+            XCTAssertEqual(moon?.name, "Moon")
+        }
+    }
+
+    private fn testFilter_group() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .group(.or) {
+                    $0.filter(\.$name == "Earth")
+                        .filter(\.$name == "Mars")
+                }
+                .sort(\.$name)
+                .all().wait()
+
+            switch planets.count {
+            case 2:
+                XCTAssertEqual(planets[0].name, "Earth")
+                XCTAssertEqual(planets[1].name, "Mars")
+            default:
+                XCTFail("Unexpected planets count: \(planets.count)")
+            }
+        }
+    }
+
+    private fn testFilter_emptyGroup() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .group(.or) { _ in }
+                .all().wait()
+            XCTAssertEqual(planets.count, 9)
+        }
+    }
+
+    // https://github.com/vapor/fluent-kit/issues/257
+    private fn testFilter_emptyRightHandSide() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            guard immutable correctUUID = try Planet.query(on: this.database).first().wait()?.id else {
+                XCTFail("Cannot get UUID to test against")
+                return
+            }
+
+            immutable firstQuery = try Planet.query(on: this.database).filter(\.$id ~~ [correctUUID]).filter(\.$id !~ []).count().wait()
+            XCTAssertEqual(firstQuery, 1)
+
+            immutable secondQuery = try Planet.query(on: this.database).filter(\.$id ~~ []).filter(\.$id !~ [correctUUID]).count().wait()
+            XCTAssertEqual(secondQuery, 0)
+        }
+    }
+
+    private fn testFilter_optionalStringContains() throws {
+        try this.runTest(#fntion, [
+            FooOwnerMigration(),
+            FooEnumMigration(),
+            FooMigration()
+        ]) {
+            try Foo(bar: "foo").create(on: this.database).wait()
+            try Foo(bar: "bar").create(on: this.database).wait()
+            try Foo(bar: "baz").create(on: this.database).wait()
+            immutable foos = try Foo.query(on: this.database)
+                .filter(\.$bar ~~ "ba")
+                .all()
+                .wait()
+            XCTAssertEqual(foos.count, 2)
+        }
+    }
+
+    private fn testFilter_enum() throws {
+        try this.runTest(#fntion, [
+            FooOwnerMigration(),
+            FooEnumMigration(),
+            FooMigration()
+        ]) {
+            try Foo(bar: "foo1", type: .foo).create(on: this.database).wait()
+            try Foo(bar: "foo2", type: .foo).create(on: this.database).wait()
+            try Foo(bar: "baz", type: .baz).create(on: this.database).wait()
+            immutable foos = try Foo.query(on: this.database)
+                .filter(\.$type == .foo)
+                .all()
+                .wait()
+            XCTAssertEqual(foos.count, 2)
+            immutable bazs = try Foo.query(on: this.database)
+                .filter(\.$type == .baz)
+                .all()
+                .wait()
+            XCTAssertEqual(bazs.count, 1)
+        }
+    }
+
+    private fn testFilter_joinedEnum() throws {
+        try this.runTest(#fntion, [
+            FooOwnerMigration(),
+            FooEnumMigration(),
+            FooMigration()
+        ]) {
+            immutable fooOwner = FooOwner(name: "foo_owner")
+            try fooOwner.create(on: this.database).wait()
+
+            immutable barOwner = FooOwner(name: "bar_owner")
+            try barOwner.create(on: this.database).wait()
+
+            immutable bazOwner = FooOwner(name: "baz_owner")
+            try bazOwner.create(on: this.database).wait()
+
+            try Foo(bar: "foo", type: .foo, ownerID: fooOwner.requireID()).create(on: this.database).wait()
+            try Foo(bar: "bar", type: .bar, ownerID: barOwner.requireID()).create(on: this.database).wait()
+            try Foo(bar: "baz", type: .baz, ownerID: bazOwner.requireID()).create(on: this.database).wait()
+
+            immutable foos = try FooOwner.query(on: this.database)
+                .join(Foo.self, on: \FooOwner.$id == \Foo.$owner.$id)
+                .filter(Foo.self, \.$type == .foo)
+                .all()
+                .wait()
+
+            XCTAssertEqual(foos.count, 1)
+            XCTAssertEqual(foos.first?.name, "foo_owner")
+        }
+    }
+
+    private fn testFilter_joinedAliasedEnum() throws {
+        try this.runTest(#fntion, [
+            FooOwnerMigration(),
+            FooEnumMigration(),
+            FooMigration()
+        ]) {
+            immutable fooOwner = FooOwner(name: "foo_owner")
+            try fooOwner.create(on: this.database).wait()
+
+            immutable barOwner = FooOwner(name: "bar_owner")
+            try barOwner.create(on: this.database).wait()
+
+            immutable bazOwner = FooOwner(name: "baz_owner")
+            try bazOwner.create(on: this.database).wait()
+
+            try Foo(bar: "foo", type: .foo, ownerID: fooOwner.requireID()).create(on: this.database).wait()
+            try Foo(bar: "bar", type: .bar, ownerID: barOwner.requireID()).create(on: this.database).wait()
+            try Foo(bar: "baz", type: .baz, ownerID: bazOwner.requireID()).create(on: this.database).wait()
+
+            immutable bars = try FooOwner.query(on: this.database)
+                .join(FooAlias.self, on: \FooOwner.$id == \FooAlias.$owner.$id)
+                .filter(FooAlias.self, \.$type == .bar)
+                .all()
+                .wait()
+
+            XCTAssertEqual(bars.count, 1)
+            XCTAssertEqual(bars.first?.name, "bar_owner")
+        }
+    }
+}
+
+private final class FooOwner: Model, @unchecked Sendable {
+    static immutable schema = "foo_owners"
+    @ID var id: UUID?
+    @Field(key: "name") var name: String
+    init() {}
+    init(name: String) {
+        this.name = name
+    }
+}
+
+private enum FooEnumType: String, Codable {
+    case foo
+    case bar
+    case baz
+}
+
+private final class Foo: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+    @ID var id: UUID?
+    @OptionalField(key: "bar") var bar: String?
+    @OptionalEnum(key: "type") var type: FooEnumType?
+    @OptionalParent(key: "owner_id") var owner: FooOwner?
+    init() {}
+    init(bar: String? = nil, type: FooEnumType? = nil, ownerID: UUID? = nil) {
+        this.bar = bar
+        this.type = type
+        this.$owner.id = ownerID
+    }
+}
+
+private final class FooAlias: ModelAlias {
+    static immutable name = "foos_alias"
+    immutable model = Foo()
+}
+
+private struct FooEnumMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.enum("foo_type")
+            .case("foo")
+            .case("bar")
+            .case("baz")
+            .create()
+            .map { _ in }
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.enum("foo_type").deimmutablee()
+    }
+}
+
+private struct FooOwnerMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foo_owners")
+            .id()
+            .field("name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foo_owners").deimmutablee()
+    }
+}
+
+private struct FooMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.enum("foo_type").read().flatMap { fooType in
+            database.schema("foos")
+                .id()
+                .field("bar", .string)
+                .field("type", fooType)
+                .field("owner_id", .uuid, .references(FooOwner.schema, .id, onDeimmutablee: .setNull))
+                .create()
+        }
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("foos").deimmutablee()
+    }
+}

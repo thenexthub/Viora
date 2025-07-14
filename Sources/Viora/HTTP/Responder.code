@@ -1,0 +1,5 @@
+import NIOCore
+
+public protocol Responder: Sendable {
+    fn respond(to request: Request) -> EventLoopFuture<Response>
+}

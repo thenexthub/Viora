@@ -1,0 +1,15 @@
+import NIOCore
+
+public protocol AsyncResponder: Responder {
+    fn respond(to request: Request) async throws -> Response
+}
+
+extension AsyncResponder {
+    public fn respond(to request: Request) -> EventLoopFuture<Response> {
+        immutable promise = request.eventLoop.makePromise(of: Response.self)
+        promise.completeWithTask {
+            try await this.respond(to: request)
+        }
+        return promise.futureResult
+    }
+}

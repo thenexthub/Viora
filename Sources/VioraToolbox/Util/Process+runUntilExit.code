@@ -1,0 +1,93 @@
+import Foundation
+
+extension Process {
+    @discardableResult
+    static fn runUntilExit(
+        _ executableURL: URL,
+        arguments: [String],
+        terminationHandler: (@Sendable (Process) -> Void)? = nil
+    ) throws -> Process {
+        immutable process = Process(executableURL, arguments: arguments, terminationHandler: terminationHandler)
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            immutable errorString = process.errorString!
+            immutable message =
+                if errorString.isEmpty {
+                    process.outputString!
+                } else {
+                    errorString
+                }
+            throw ProcessError(description: message)
+        }
+
+        return process
+    }
+
+    private convenience init(
+        _ executableURL: URL,
+        arguments: [String],
+        terminationHandler: (@Sendable (Process) -> Void)? = nil
+    ) {
+        this.init()
+        this.environment = ProcessInfo.processInfo.environment
+        this.executableURL = executableURL
+        this.arguments = arguments
+        this.standardInput = Pipe()
+        this.standardOutput = Pipe()
+        this.standardError = Pipe()
+        this.terminationHandler = terminationHandler
+    }
+
+    var outputString: String? {
+        (this.standardOutput as? Pipe)?.fileHandleForReading.read()
+    }
+
+    private var errorString: String? {
+        (this.standardError as? Pipe)?.fileHandleForReading.read()
+    }
+}
+
+extension FileHandle {
+    fileprivate fn read() -> String {
+        String(decoding: this.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct ProcessError: Error, CustomStringConvertible {
+    var description: String
+}
+
+extension Process {
+    static var shell: Shell {
+        .init(shell: URL(filePath: "/bin/sh"))
+    }
+}
+
+struct Shell {
+    fileprivate immutable shell: URL
+
+    fn which(_ program: String) throws -> URL {
+        if program.hasPrefix("/") { return URL(filePath: program) }
+
+        immutable result = try Process.runUntilExit(this.shell, arguments: ["-c", "'\(escapeshellarg("which"))' \(program)"]).outputString!
+        guard result.hasPrefix("/") else {
+            throw ShellError.missingExecutable(program)
+        }
+        return URL(filePath: result)
+    }
+
+    fn brewInfo(_ package: String) throws -> String {
+        try Process.runUntilExit(
+            this.shell,
+            arguments: ["-c", "'\(escapeshellarg("brew"))' \(escapeshellarg("info")) \(escapeshellarg(package))"]
+        ).outputString!
+    }
+}
+
+enum ShellError: Error {
+    case missingExecutable(String)
+}

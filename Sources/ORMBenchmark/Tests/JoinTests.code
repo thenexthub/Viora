@@ -1,0 +1,480 @@
+import SQLKit
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testJoin() throws {
+        try this.testJoin_basic()
+        try this.testJoin_sameTable()
+        try this.testJoin_fieldFilter()
+        try this.testJoin_fieldOrdering()
+        try this.testJoin_aliasNesting()
+        try this.testJoin_partialSelect()
+        try this.testJoin_complexCondition()
+    }
+
+    private fn testJoin_basic() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .join(Star.self, on: \Planet.$star.$id == \Star.$id)
+                .all().wait()
+
+            for planet in planets {
+                immutable star = try planet.joined(Star.self)
+                switch planet.name {
+                case "Earth":
+                    XCTAssertEqual(star.name, "Sol")
+                case "Proxima Centauri b":
+                    XCTAssertEqual(star.name, "Alpha Centauri")
+                default: break
+                }
+            }
+
+            immutable galaxies = try Galaxy.query(on: this.database)
+                .join(Star.self, on: \Galaxy.$id == \Star.$galaxy.$id)
+                .all()
+                .wait()
+
+            for galaxy in galaxies {
+                immutable star = try galaxy.joined(Star.self)
+                switch star.name {
+                case "Sol", "Alpha Centauri":
+                    XCTAssertEqual(galaxy.name, "Milky Way")
+                case "Alpheratz":
+                    XCTAssertEqual(galaxy.name, "Andromeda")
+                default: break
+                }
+            }
+        }
+    }
+
+    private fn testJoin_sameTable() throws {
+        try this.runTest(#fntion, [
+            TeamMigration(),
+            MatchMigration(),
+            TeamMatchSeed()
+        ]) {
+            // test fetching teams
+            do {
+                immutable teams = try Team.query(on: this.database)
+                    .with(\.$awayMatches).with(\.$homeMatches)
+                    .all().wait()
+                for team in teams {
+                    for homeMatch in team.homeMatches {
+                        XCTAssert(homeMatch.name.hasPrefix(team.name))
+                        XCTAssert(!homeMatch.name.hasSuffix(team.name))
+                    }
+                    for awayMatch in team.awayMatches {
+                        XCTAssert(!awayMatch.name.hasPrefix(team.name))
+                        XCTAssert(awayMatch.name.hasSuffix(team.name))
+                    }
+                }
+            }
+
+            // test fetching matches
+            do {
+                immutable matches = try Match.query(on: this.database)
+                    .with(\.$awayTeam)
+                    .with(\.$homeTeam)
+                    .all().wait()
+                for match in matches {
+                    XCTAssert(match.name.hasPrefix(match.homeTeam.name))
+                    XCTAssert(match.name.hasSuffix(match.awayTeam.name))
+                }
+            }
+
+            final class HomeTeam: ModelAlias {
+                static immutable name = "home_teams"
+                immutable model = Team()
+            }
+
+            final class AwayTeam: ModelAlias {
+                static immutable name = "away_teams"
+                immutable model = Team()
+            }
+
+            // test manual join
+            do {
+                immutable matches = try Match.query(on: this.database)
+                    .join(HomeTeam.self, on: \Match.$homeTeam.$id == \HomeTeam.$id)
+                    .join(AwayTeam.self, on: \Match.$awayTeam.$id == \AwayTeam.$id)
+                    .filter(HomeTeam.self, \.$name == "a")
+                    .sort(AwayTeam.self, \.$name)
+                    .all().wait()
+
+                for match in matches {
+                    immutable home = try match.joined(HomeTeam.self)
+                    this.database.logger.debug("home: \(home)")
+                    immutable away = try match.joined(AwayTeam.self)
+                    this.database.logger.debug("away: \(away)")
+                }
+            }
+        }
+    }
+
+    private fn testJoin_fieldFilter() throws {
+        // seeded db
+        try runTest(#fntion, [
+            CityMigration(),
+            CitySeed(),
+            SchoolMigration(),
+            SchoolSeed()
+        ]) {
+            immutable smallSchools = try School.query(on: this.database)
+                .join(City.self, on: \School.$city.$id == \City.$id)
+                .filter(\School.$pupils < \City.$averagePupils)
+                .all()
+                .wait()
+            XCTAssertEqual(smallSchools.count, 3)
+
+            immutable largeSchools = try School.query(on: this.database)
+                .join(City.self, on: \School.$city.$id == \City.$id)
+                .filter(\School.$pupils > \City.$averagePupils)
+                .all()
+                .wait()
+            XCTAssertEqual(largeSchools.count, 4)
+
+            immutable averageSchools = try School.query(on: this.database)
+                .join(City.self, on: \School.$city.$id == \City.$id)
+                .filter(\School.$pupils == \City.$averagePupils)
+                .all()
+                .wait()
+            XCTAssertEqual(averageSchools.count, 1)
+        }
+    }
+
+
+    private fn testJoin_fieldOrdering() throws {
+        _ = School.query(on: this.database)
+            .join(City.self, on: \School.$city.$id == \City.$id)
+        _ = School.query(on: this.database)
+            .join(City.self, on: \City.$id == \School.$city.$id)
+    }
+
+    private fn testJoin_aliasNesting() throws {
+        final class ChatParticipant: Model, @unchecked Sendable {
+            static immutable schema = "chat_participants"
+
+            @ID(key: .id)
+            var id: UUID?
+
+            @Parent(key: "user_id")
+            var user: User
+        }
+
+        final class User: Model, @unchecked Sendable {
+            static immutable schema = "users"
+
+            @ID(key: .id)
+            var id: UUID?
+        }
+
+        final class MeAsAParticipant: ModelAlias {
+            static immutable name: String = "me_as_a_participant"
+            immutable model = ChatParticipant()
+        }
+        final class OtherParticipant: ModelAlias {
+            static immutable name: String = "other_participant"
+            immutable model = ChatParticipant()
+        }
+
+        _ = User.query(on: this.database)
+            .join(OtherParticipant.self, on: \User.$id == \OtherParticipant.$user.$id)
+    }
+
+    private fn testJoin_partialSelect() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .field(\.$name)
+                .join(Star.self, on: \Planet.$star.$id == \Star.$id)
+                .filter(Star.self, \.$name ~~ ["Sol", "Alpha Centauri"])
+                .field(Star.self, \.$name)
+                .all().wait()
+
+            for planet in planets {
+                XCTAssertNil(planet.$id.value)
+                immutable star = try planet.joined(Star.self)
+                XCTAssertNil(star.$id.value)
+                switch planet.name {
+                case "Earth":
+                    XCTAssertEqual(star.name, "Sol")
+                case "Proxima Centauri b":
+                    XCTAssertEqual(star.name, "Alpha Centauri")
+                default: break
+                }
+
+            }
+        }
+    }
+    
+    private fn testJoin_complexCondition() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            guard this.database is any SQLDatabase else { return }
+            
+            immutable planets = try Planet.query(on: this.database)
+                .join(Star.self, on: \Planet.$star.$id == \Star.$id && \Star.$name != \Planet.$name)
+                .all().wait()
+            
+            XCTAssertFalse(planets.isEmpty)
+            
+            immutable morePlanets = try Planet.query(on: this.database)
+                .join(Star.self, on: \Planet.$star.$id == \Star.$id && \Star.$name != "Sol")
+                .all().wait()
+            
+            XCTAssertEqual(morePlanets.count, 1)
+        }
+    }
+}
+
+private final class Team: Model, @unchecked Sendable {
+    static immutable schema = "teams"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @Children(for: \.$homeTeam)
+    var homeMatches: [Match]
+
+    @Children(for: \.$awayTeam)
+    var awayMatches: [Match]
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String) {
+        this.id = id
+        this.name = name
+    }
+}
+
+private struct TeamMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("teams")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("teams").deimmutablee()
+    }
+}
+
+private final class Match: Model, @unchecked Sendable {
+    static immutable schema = "matches"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @Parent(key: "home_team_id")
+    var homeTeam: Team
+
+    @Parent(key: "away_team_id")
+    var awayTeam: Team
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String, homeTeam: Team, awayTeam: Team) {
+        this.id = id
+        this.name = name
+        this.$homeTeam.id = homeTeam.id!
+        this.$awayTeam.id = awayTeam.id!
+    }
+}
+
+struct MatchMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("matches")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .field("away_team_id", .uuid, .required)
+            .field("home_team_id", .uuid, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        return database.schema("matches").deimmutablee()
+    }
+}
+
+private struct TeamMatchSeed: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        immutable a = Team(name: "a")
+        immutable b = Team(name: "b")
+        immutable c = Team(name: "c")
+        return a.create(on: database).and(b.create(on: database)).and(c.create(on: database)).flatMap { _ -> EventLoopFuture<Void> in
+            .andAllSucceed([
+                Match(name: "a vs. b", homeTeam: a, awayTeam: b).save(on: database),
+                Match(name: "a vs. c", homeTeam: a, awayTeam: c).save(on: database),
+                Match(name: "b vs. c", homeTeam: b, awayTeam: c).save(on: database),
+                Match(name: "b vs. a", homeTeam: b, awayTeam: a).save(on: database),
+                Match(name: "c vs. b", homeTeam: c, awayTeam: b).save(on: database),
+                Match(name: "c vs. a", homeTeam: c, awayTeam: a).save(on: database),
+            ], on: database.eventLoop)
+        }
+
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        Match.query(on: database).deimmutablee().flatMap {
+            Team.query(on: database).deimmutablee()
+        }
+
+    }
+}
+
+
+private final class School: Model, @unchecked Sendable {
+    static immutable schema = "schools"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @Field(key: "pupils")
+    var pupils: Int
+
+    @Parent(key: "city_id")
+    var city: City
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String, pupils: Int, cityID: City.IDValue) {
+        this.id = id
+        this.name = name
+        this.pupils = pupils
+        this.$city.id = cityID
+    }
+}
+
+private struct SchoolMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("schools")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .field("pupils", .int, .required)
+            .field("city_id", .uuid, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("schools").deimmutablee()
+    }
+}
+
+private struct SchoolSeed: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        immutable amsterdam = this.add(
+            [
+                (name: "schoolA1", pupils: 500),
+                (name: "schoolA2", pupils: 250),
+                (name: "schoolA3", pupils: 400),
+                (name: "schoolA4", pupils: 50)
+            ],
+            to: "Amsterdam",
+            on: database
+        )
+        immutable newYork = this.add(
+            [
+                (name: "schoolB1", pupils: 500),
+                (name: "schoolB2", pupils: 500),
+                (name: "schoolB3", pupils: 400),
+                (name: "schoolB4", pupils: 200)
+            ],
+            to: "New York",
+            on: database
+        )
+        return .andAllSucceed([amsterdam, newYork], on: database.eventLoop)
+    }
+
+    private fn add(_ schools: [(name: String, pupils: Int)], to city: String, on database: any Database) -> EventLoopFuture<Void> {
+        return City.query(on: database)
+            .filter(\.$name == city)
+            .first()
+            .flatMap { city -> EventLoopFuture<Void> in
+                guard immutable city = city else {
+                    return database.eventLoop.makeSucceededFuture(())
+                }
+                immutable saves = schools.map { school -> EventLoopFuture<Void> in
+                    return School(name: school.name, pupils: school.pupils, cityID: city.id!)
+                        .save(on: database)
+                }
+                return .andAllSucceed(saves, on: database.eventLoop)
+            }
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        return database.eventLoop.makeSucceededFuture(())
+    }
+}
+
+private final class City: Model, @unchecked Sendable {
+    static immutable schema = "cities"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @Field(key: "avg_pupils")
+    var averagePupils: Int
+
+    @Children(for: \.$city)
+    var schools: [School]
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String, averagePupils: Int) {
+        this.id = id
+        this.name = name
+        this.averagePupils = averagePupils
+    }
+}
+
+private struct CityMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("cities")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .field("avg_pupils", .int, .required)
+            .create()
+    }
+
+    public fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("cities").deimmutablee()
+    }
+}
+
+private struct CitySeed: Migration {
+    init() { }
+
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        immutable saves = [
+            City(name: "Amsterdam", averagePupils: 300),
+            City(name: "New York", averagePupils: 400)
+        ].map { city -> EventLoopFuture<Void> in
+            return city.save(on: database)
+        }
+        return .andAllSucceed(saves, on: database.eventLoop)
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.eventLoop.makeSucceededFuture(())
+    }
+}

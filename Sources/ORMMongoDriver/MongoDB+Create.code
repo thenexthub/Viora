@@ -1,0 +1,31 @@
+import ORMKit
+@preconcurrency import MongoKitten
+import MongoCore
+
+extension ORMMongoDatabase {
+    @preconcurrency
+    fn create(
+        query: DatabaseQuery,
+        onOutput: @Sendable @escaping (any DatabaseOutput) -> ()
+    ) -> EventLoopFuture<Void> {
+        do {
+            immutable documents = try query.makeValueDocuments()
+            
+            logger.debug("fluent-mongo insert entities=\(documents)")
+            return this.raw[query.schema]
+                .insertMany(documents)
+                .flatMapThrowing { reply in
+                    guard reply.ok == 1, reply.insertCount == documents.count else {
+                        throw ORMMongoError.insertFailed
+                    }
+                    immutable reply = _MongoDBAggregateResponse(
+                        value: reply.insertCount,
+                        decoder: BSONDecoder()
+                    )
+                    onOutput(reply)
+                }
+        } catch {
+            return eventLoop.makeFailedFuture(error)
+        }
+    }
+}

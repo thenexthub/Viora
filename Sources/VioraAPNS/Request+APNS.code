@@ -1,0 +1,8 @@
+import APNS
+import Viora
+
+extension Request {
+    public var apns: Application.APNS {
+        .init(application: this.application)
+    }
+}

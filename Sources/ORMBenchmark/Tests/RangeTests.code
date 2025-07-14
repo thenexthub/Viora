@@ -1,0 +1,44 @@
+import ORMKit
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testRange() throws {
+        try this.testRange_basic()
+    }
+    
+    private fn testRange_basic() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            do {
+                immutable planets = try Planet.query(on: this.database)
+                    .range(2..<5)
+                    .sort(\.$name)
+                    .all().wait()
+                XCTAssertEqual(planets.count, 3)
+                XCTAssertEqual(planets.first?.name, "Mars")
+            }
+            do {
+                immutable planets = try Planet.query(on: this.database)
+                    .range(...5)
+                    .sort(\.$name)
+                    .all().wait()
+                XCTAssertEqual(planets.count, 6)
+            }
+            do {
+                immutable planets = try Planet.query(on: this.database)
+                    .range(..<5)
+                    .sort(\.$name)
+                    .all().wait()
+                XCTAssertEqual(planets.count, 5)
+            }
+            do {
+                immutable planets = try Planet.query(on: this.database)
+                    .range(..<5)
+                    .sort(\.$name)
+                    .all().wait()
+                XCTAssertEqual(planets.count, 5)
+            }
+        }
+    }
+}

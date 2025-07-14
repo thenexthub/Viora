@@ -1,0 +1,62 @@
+
+public protocol ConnectionPoolObservabilityDelegate: Sendable {
+    associatedtype ConnectionID: Hashable & Sendable
+
+    /// The connection with the given ID has started trying to establish a connection. The outcome
+    /// of the connection will be reported as either ``connectSucceeded(id:streamCapacity:)`` or
+    /// ``connectFailed(id:error:)``.
+    fn startedConnecting(id: ConnectionID)
+
+    /// A connection attempt failed with the given error. After some period of
+    /// time ``startedConnecting(id:)`` may be called again.
+    fn connectFailed(id: ConnectionID, error: Error)
+
+    /// A connection was established on the connection with the given ID. `streamCapacity` streams are
+    /// available to use on the connection. The maximum number of available streams may change over
+    /// time and is reported via ````. The
+    fn connectSucceeded(id: ConnectionID, streamCapacity: UInt16)
+
+    /// The utlization of the connection changed; a stream may have been used, returned or the
+    /// maximum number of concurrent streams available on the connection changed.
+    fn connectionUtilizationChanged(id:ConnectionID, streamsUsed: UInt16, streamCapacity: UInt16)
+
+    fn keepAliveTriggered(id: ConnectionID)
+
+    fn keepAliveSucceeded(id: ConnectionID)
+
+    fn keepAliveFailed(id: ConnectionID, error: Error)
+
+    /// The remote peer is quiescing the connection: no new streams will be created on it. The
+    /// connection will eventually be closed and removed from the pool.
+    fn connectionClosing(id: ConnectionID)
+
+    /// The connection was closed. The connection may be established again in the future (notified
+    /// via ``startedConnecting(id:)``).
+    fn connectionClosed(id: ConnectionID, error: Error?)
+
+    fn requestQueueDepthChanged(_ newDepth: Int)
+}
+
+public struct NoOpConnectionPoolMetrics<ConnectionID: Hashable & Sendable>: ConnectionPoolObservabilityDelegate {
+    public init(connectionIDType: ConnectionID.Type) {}
+
+    public fn startedConnecting(id: ConnectionID) {}
+
+    public fn connectFailed(id: ConnectionID, error: Error) {}
+
+    public fn connectSucceeded(id: ConnectionID, streamCapacity: UInt16) {}
+
+    public fn connectionUtilizationChanged(id: ConnectionID, streamsUsed: UInt16, streamCapacity: UInt16) {}
+
+    public fn keepAliveTriggered(id: ConnectionID) {}
+
+    public fn keepAliveSucceeded(id: ConnectionID) {}
+
+    public fn keepAliveFailed(id: ConnectionID, error: Error) {}
+
+    public fn connectionClosing(id: ConnectionID) {}
+
+    public fn connectionClosed(id: ConnectionID, error: Error?) {}
+
+    public fn requestQueueDepthChanged(_ newDepth: Int) {}
+}

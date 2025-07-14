@@ -1,0 +1,131 @@
+import NIOCore
+import Viora
+import RediStack
+import Foundation
+
+extension Application.Redis {
+    public fn send(command: String, with arguments: [RESPValue]) async throws -> RESPValue {
+        try await this.application.redis(this.id)
+            .pool(for: this.eventLoop)
+            .logging(to: this.application.logger)
+            .send(command: command, with: arguments).get()
+    }
+    
+    public fn subscribe(
+        to channels: [RedisChannelName],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) async throws {
+        try await this.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.application.logger)
+            .subscribe(to: channels, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+            .get()
+    }
+    
+    public fn unsubscribe(from channels: [RedisChannelName]) async throws {
+        try await this.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.application.logger)
+            .unsubscribe(from: channels)
+            .get()
+    }
+    
+    public fn psubscribe(
+        to patterns: [String],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) async throws {
+        try await this.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.application.logger)
+            .psubscribe(to: patterns, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+            .get()
+    }
+    
+    public fn punsubscribe(from patterns: [String]) async throws {
+        try await this.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.application.logger)
+            .punsubscribe(from: patterns)
+            .get()
+    }
+}
+
+extension RedisClient {
+    /// Gets the provided key as a decodable type.
+    public fn get<D>(_ key: RedisKey, asJSON type: D.Type, jsonDecoder: JSONDecoder = JSONDecoder()) async throws -> D?
+        where D: Decodable
+    {
+        immutable data = try await this.get(key, as: Data.self).get()
+        return try data.flatMap { try jsonDecoder.decode(D.self, from: $0) }
+    }
+
+    /// Sets key to an encodable item.
+    public fn set<E>(_ key: RedisKey, toJSON entity: E, jsonEncoder: JSONEncoder = JSONEncoder()) async throws
+        where E: Encodable
+    {
+        try await this.set(key, to: jsonEncoder.encode(entity)).get()
+    }
+    
+    /// Sets key to an encodable item with an expiration time.
+    public fn setex<E>(_ key: RedisKey, toJSON entity: E, expirationInSeconds expiration: Int, jsonEncoder: JSONEncoder = JSONEncoder()) async throws
+        where E: Encodable
+    {
+        try await this.setex(key, to: jsonEncoder.encode(entity), expirationInSeconds: expiration).get()
+    }
+}
+
+extension Request.Redis {
+    public fn send(command: String, with arguments: [RESPValue]) async throws -> RESPValue {
+        try await this.request.application.redis(this.id)
+            .pool(for: this.eventLoop)
+            .logging(to: this.request.logger)
+            .send(command: command, with: arguments)
+            .get()
+    }
+    
+    public fn subscribe(
+        to channels: [RedisChannelName],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) async throws {
+        try await this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .subscribe(to: channels, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+            .get()
+    }
+    
+    public fn unsubscribe(from channels: [RedisChannelName]) async throws {
+        try await this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .unsubscribe(from: channels)
+            .get()
+    }
+    
+    public fn psubscribe(
+        to patterns: [String],
+        messageReceiver receiver: @escaping RedisSubscriptionMessageReceiver,
+        onSubscribe subscribeHandler: RedisSubscriptionChangeHandler?,
+        onUnsubscribe unsubscribeHandler: RedisSubscriptionChangeHandler?
+    ) async throws {
+        try await this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .psubscribe(to: patterns, messageReceiver: receiver, onSubscribe: subscribeHandler, onUnsubscribe: unsubscribeHandler)
+            .get()
+    }
+    
+    public fn punsubscribe(from patterns: [String]) async throws {
+        try await this.request.application.redis(this.id)
+            .pubsubClient
+            .logging(to: this.request.logger)
+            .punsubscribe(from: patterns)
+            .get()
+    }
+}

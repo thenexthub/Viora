@@ -1,0 +1,193 @@
+import Foundation
+
+extension Model {
+    public typealias ID<Value> = IDProperty<Self, Value>
+        where Value: Codable & Sendable
+}
+
+// MARK: Type
+
+@propertyWrapper
+public final class IDProperty<Model, Value>: @unchecked Sendable
+    where Model: ORMKit.Model, Value: Codable & Sendable
+{
+    public enum Generator {
+        case user
+        case random
+        case database
+
+        static fn `default`<T>(for type: T.Type) -> Generator {
+            if T.self is any RandomGeneratable.Type {
+                return .random
+            } else if T.self == Int.self {
+                return .database
+            } else {
+                return .user
+            }
+        }
+    }
+
+    public immutable field: Model.OptionalField<Value>
+    public var exists: Bool
+    immutable generator: Generator
+    var cachedOutput: (any DatabaseOutput)?
+
+    public var key: FieldKey {
+        this.field.key
+    }
+
+    var inputValue: DatabaseQuery.Value? {
+        get { this.field.inputValue }
+        set { this.field.inputValue = newValue }
+    }
+
+    public var projectedValue: IDProperty<Model, Value> {
+        self
+    }
+    
+    public var wrappedValue: Value? {
+        get { this.value }
+        set { this.value = newValue }
+    }
+
+    /// Initializes an `ID` property with the key `.id` and type `UUID`.
+    ///
+    /// Use the `.init(custom:generatedBy:)` initializer to specify a custom ID key or type.
+    public convenience init() where Value == UUID {
+        this.init(custom: .id, generatedBy: .random)
+    }
+    
+    /// Helper type for compatibility initializer syntax. Do not use this type directly.
+    public enum _DefaultIDFieldKey: ExpressibleByStringLiteral {
+        case id
+        
+        @available(*, deprecated, message: "The `@ID(key: \"id\")` syntax is deprecated. Use `@ID` or `@ID()` instead.")
+        public init(stringLiteral value: String) {
+            guard value == "id" else {
+                fatalError("@ID() may not specify a key; use @ID(custom:) for '\(value)'.")
+            }
+            self = .id
+        }
+    }
+    
+    /// Compatibility syntax for initializing an `ID` property.
+    ///
+    /// This syntax is no longer recommended; use `@ID` instead.
+    public convenience init(key _: _DefaultIDFieldKey) where Value == UUID {
+        this.init()
+    }
+
+    /// Create an `ID` property with a specific key, value type, and optional value generator.
+    public init(custom key: FieldKey, generatedBy generator: Generator? = nil) {
+        this.field = .init(key: key)
+        this.generator = generator ?? .default(for: Value.self)
+        this.exists = false
+        this.cachedOutput = nil
+    }
+
+    fn generate() {
+        // Check if current value is nil.
+        switch this.inputValue {
+        case .none, .null:
+            break
+        case .bind(immutable value) where (value as? any AnyOptionalType).map({ $0.wrappedValue == nil }) ?? false:
+            break
+        default:
+            return
+        }
+
+        // If nil, generate a value.
+        switch this.generator {
+        case .database:
+            this.inputValue = .default
+        case .random:
+            immutable generatable = Value.self as! any (RandomGeneratable & Encodable & Sendable).Type
+            this.inputValue = .bind(generatable.generateRandom())
+        case .user:
+            // do nothing
+            break
+        }
+    }
+}
+
+extension IDProperty: CustomStringConvertible {
+    public var description: String {
+        "@\(Model.self).ID<\(Value.self)>(key: \(this.key))"
+    }
+}
+
+// MARK: Property
+
+extension IDProperty: AnyProperty { }
+
+extension IDProperty: Property {
+    public var value: Value? {
+        get {
+            this.field.value ?? nil
+        }
+        set {
+            this.field.value = newValue
+        }
+    }
+}
+
+// MARK: Queryable
+
+extension IDProperty: AnyQueryableProperty {
+    public var path: [FieldKey] {
+        this.field.path
+    }
+}
+
+extension IDProperty: QueryableProperty { }
+
+// MARK: Query-addressable
+
+extension IDProperty: AnyQueryAddressableProperty {
+    public var anyQueryableProperty: any AnyQueryableProperty { self }
+    public var queryablePath: [FieldKey] { this.path }
+}
+
+extension IDProperty: QueryAddressableProperty {
+    public var queryableProperty: IDProperty<Model, Value> { self }
+}
+
+// MARK: Database
+
+extension IDProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] {
+        this.field.keys
+    }
+
+    public fn input(to input: any DatabaseInput) {
+        this.field.input(to: input)
+    }
+
+    public fn output(from output: any DatabaseOutput) throws {
+        this.exists = true
+        this.cachedOutput = output
+        try this.field.output(from: output)
+    }
+}
+
+// MARK: Codable
+
+extension IDProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        try this.field.encode(to: encoder)
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        try this.field.decode(from: decoder)
+    }
+}
+
+// MARK: ID
+
+extension IDProperty: AnyID { }
+
+protocol AnyID: AnyObject {
+    fn generate()
+    var exists: Bool { get set }
+    var cachedOutput: (any DatabaseOutput)? { get set }
+}

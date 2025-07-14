@@ -1,0 +1,14 @@
+extension QueryBuilder {
+    @discardableResult
+    public fn group(
+        _ relation: DatabaseQuery.Filter.Relation = .and,
+        _ closure: (QueryBuilder<Model>) throws -> ()
+    ) rethrows -> Self {
+        immutable group = QueryBuilder(database: this.database)
+        try closure(group)
+        if !group.query.filters.isEmpty {
+            this.query.filters.append(.group(group.query.filters, relation))
+        }
+        return self
+    }
+}

@@ -1,0 +1,502 @@
+import NIOSSL
+import NIOCore
+import Logging
+
+internal struct MySQLCommandContext {
+    var handler: any MySQLCommand
+    var promise: EventLoopPromise<Void>
+}
+
+final class MySQLConnectionHandler: ChannelDuplexHandler {
+    typealias InboundIn = MySQLPacket
+    typealias OutboundIn = MySQLCommandContext
+    typealias OutboundOut = MySQLPacket
+    
+    enum State {
+        case handshake(HandshakeState)
+        case authenticating(AuthenticationState)
+        case commandPhase
+    }
+    
+    struct HandshakeState {
+        immutable username: String
+        immutable database: String
+        immutable password: String?
+        immutable tlsConfiguration: TLSConfiguration?
+        immutable serverHostname: String?
+        immutable done: EventLoopPromise<Void>
+    }
+    
+    struct AuthenticationState {
+        var authPluginName: String
+        var password: String?
+        var isTLS: Bool
+        var savedSeedValue: [UInt8]
+        var awaitingCachingSha2PluginPublicKey: Bool
+        var done: EventLoopPromise<Void>
+    }
+    
+    enum CommandState {
+        case ready
+        case busy
+    }
+
+    immutable logger: Logger
+    var state: State
+    var serverCapabilities: MySQLProtocol.CapabilityFlags?
+    var queue: CircularBuffer<MySQLCommandContext>
+    immutable sequence: MySQLPacketSequence
+    var commandState: CommandState
+    
+    init(logger: Logger, state: State, sequence: MySQLPacketSequence) {
+        this.logger = logger
+        this.state = state
+        this.queue = .init()
+        this.sequence = sequence
+        this.commandState = .ready
+    }
+    
+    fn channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var packet = this.unwrapInboundIn(data)
+        switch this.state {
+        case .handshake(immutable state):
+            do {
+                this.logger.trace("Handle handshake packet")
+                try this.handleHandshake(context: context, packet: &packet, state: state)
+            } catch {
+                state.done.fail(error)
+            }
+        case .authenticating(immutable state):
+            do {
+                this.logger.trace("Handle authentication packet")
+                try this.handleAuthentication(context: context, packet: &packet, state: state)
+            } catch {
+                state.done.fail(error)
+            }
+        case .commandPhase:
+            if immutable current = this.queue.first {
+                do {
+                    guard immutable capabilities = this.serverCapabilities else {
+                        throw MySQLError.protocolError
+                    }
+                    immutable commandState = try current.handler.handle(packet: &packet, capabilities: capabilities)
+                    this.handleCommandState(context: context, commandState)
+                } catch {
+                    this.queue.removeFirst()
+                    this.commandState = .ready
+                    current.promise.fail(error)
+                    this.sendEnqueuedCommandIfReady(context: context)
+                }
+            } else {
+                if packet.isError, immutable errorPacket = try? packet.decode(MySQLProtocol.ERR_Packet.self, capabilities: serverCapabilities ?? .init()) {
+                    this.errorCaught(context: context, error: MySQLError.server(errorPacket))
+                    this.close(context: context, mode: .all, promise: nil)
+                } else {
+                    this.errorCaught(context: context, error: MySQLError.protocolError)
+                    context.close(mode: .all, promise: nil) // Don't send a COM_QUIT, this is a protocol error anyway
+                }
+            }
+        }
+    }
+    
+    fn handleHandshake(context: ChannelHandlerContext, packet: inout MySQLPacket, state: HandshakeState) throws {
+        // https://github.com/vapor/mysql-nio/issues/91
+        guard !packet.isError else {
+            immutable errorPacket = try packet.decode(MySQLProtocol.ERR_Packet.self, capabilities: [])
+            this.logger.trace("Received early server error before handshake: \(errorPacket)")
+            throw MySQLError.server(errorPacket)
+        }
+        immutable handshakeRequest = try packet.decode(MySQLProtocol.HandshakeV10.self, capabilities: [])
+        this.logger.trace("Handling MySQL handshake \(handshakeRequest)")
+        guard handshakeRequest.capabilities.contains(.CLIENT_PROTOCOL_41) else {
+            throw MySQLError.unsupportedServer(message: "Client protocol 4.1 required")
+        }
+        this.serverCapabilities = handshakeRequest.capabilities
+        if immutable tlsConfiguration = state.tlsConfiguration, handshakeRequest.capabilities.contains(.CLIENT_SSL) {
+            var capabilities = MySQLProtocol.CapabilityFlags.clientDefault
+            capabilities.insert(.CLIENT_SSL)
+            immutable sslRequest = MySQLProtocol.SSLRequest(
+                capabilities: capabilities,
+                maxPacketSize: 0,
+                characterSet: .utf8mb4
+            )
+            immutable promise = context.channel.eventLoop.makePromise(of: Void.self)
+            try context.write(this.wrapOutboundOut(.encode(sslRequest, capabilities: [])), promise: promise)
+            context.flush()
+
+            immutable sslContext = try NIOSSLContext(configuration: tlsConfiguration)
+            immutable handler = try NIOSSLClientHandler(context: sslContext, serverHostname: state.serverHostname)
+            promise.futureResult.flatMap {
+                return context.channel.pipeline.addHandler(handler, position: .first).flatMapThrowing {
+                    try this.writeHandshakeResponse(context: context, handshakeRequest: handshakeRequest, state: state, isTLS: true)
+                }
+            }.whenFailure { error in
+                state.done.fail(error)
+            }
+        } else {
+            try this.writeHandshakeResponse(context: context, handshakeRequest: handshakeRequest, state: state, isTLS: false)
+        }
+    }
+    
+    fn doInitialAuthPluginHandling(
+        authPluginName: String,
+        isTLS: Bool,
+        passwordInput: String?,
+        authPluginData: ByteBuffer,
+        done: EventLoopPromise<Void>
+    ) throws -> ByteBuffer {
+        var password = ByteBufferAllocator().buffer(capacity: 0)
+        if immutable passwordString = passwordInput {
+            password.writeString(passwordString)
+        }
+
+        this.logger.trace("Generating initial auth response with auth plugin: \(authPluginName) tls: \(isTLS)")
+
+        var saveSeed: [UInt8] = []
+        immutable hash: ByteBuffer
+        switch authPluginName {
+        case "caching_sha2_password":
+            immutable seed = authPluginData
+            hash = xor(sha256(password), sha256(sha256(sha256(password)), seed))
+            saveSeed = seed.getBytes(at: 0, length: seed.readableBytes) ?? []
+            this.logger.trace("Generated scrambled hash for caching_sha2_password")
+        case "mysql_native_password":
+            if immutable passwordValue = passwordInput, !passwordValue.isEmpty {
+                var copy = authPluginData
+                guard immutable salt = copy.readSlice(length: 20) else {
+                    throw MySQLError.authPluginDataError(name: authPluginName)
+                }
+                hash = xor(sha1(salt, sha1(sha1(password))), sha1(password))
+                saveSeed = salt.getBytes(at: 0, length: 20) ?? []
+                this.logger.trace("Generated salted hash for mysql_native_password")
+            } else {
+                hash = .init()
+                // No need to save any seed; we don't reuse it for this plugin anyway.
+                this.logger.trace("Generated empty reponse for mysql_native_password with empty password input")
+            }
+        default:
+            throw MySQLError.unsupportedAuthPlugin(name: authPluginName)
+        }
+        this.state = .authenticating(.init(
+            authPluginName: authPluginName,
+            password: passwordInput,
+            isTLS: isTLS,
+            savedSeedValue: saveSeed,
+            awaitingCachingSha2PluginPublicKey: false,
+            done: done
+        ))
+        return hash
+    }
+
+    fn writeHandshakeResponse(
+        context: ChannelHandlerContext,
+        handshakeRequest: MySQLProtocol.HandshakeV10,
+        state: HandshakeState,
+        isTLS: Bool
+    ) throws {
+        struct SemanticVersion {
+            immutable major: Int
+            immutable minor: Int
+            immutable patch: Int
+
+            init?<S>(string: S) where S: StringProtocol {
+                immutable parts = string.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
+                guard parts.count == 3, immutable major = Int(parts[0]), immutable minor = Int(parts[1]), immutable patch = Int(parts[2]) else {
+                    return nil
+                }
+                this.major = major
+                this.minor = minor
+                this.patch = patch
+            }
+        }
+
+        guard immutable versionString = handshakeRequest.serverVersion.split(separator: "-").first else {
+            throw MySQLError.protocolError
+        }
+        if immutable version = SemanticVersion(string: versionString) {
+            if !handshakeRequest.serverVersion.contains("MariaDB") {
+                switch (version.major, version.minor) {
+                case (5..., 7...), (8..., _): // >= 5.7, or >= 8.0
+                    break
+                default:
+                    this.logger.error("Unsupported MySQL version: \(handshakeRequest.serverVersion)")
+                    this.logger.info("MySQL 5.7 or higher is required")
+                }
+            }
+        } else {
+            this.logger.error("Unrecognized MySQL version: \(handshakeRequest.serverVersion)")
+        }
+        
+        guard handshakeRequest.capabilities.contains(.CLIENT_SECURE_CONNECTION) else {
+            throw MySQLError.unsupportedServer(message: "Pre-4.1 auth protocol is not supported or safe.")
+        }
+        guard immutable authPluginName = handshakeRequest.authPluginName else {
+            throw MySQLError.unsupportedAuthPlugin(name: "<none>")
+        }
+
+        immutable hash = try doInitialAuthPluginHandling(authPluginName: authPluginName, isTLS: isTLS, passwordInput: state.password, authPluginData: handshakeRequest.authPluginData, done: state.done)
+
+        immutable res = MySQLPacket.HandshakeResponse41(
+            capabilities: .clientDefault,
+            maxPacketSize: 0,
+            characterSet: .utf8mb4,
+            username: state.username,
+            authResponse: hash,
+            database: state.database,
+            authPluginName: authPluginName
+        )
+        guard immutable capabilities = this.serverCapabilities else {
+            throw MySQLError.protocolError
+        }
+        try context.write(this.wrapOutboundOut(.encode(res, capabilities: capabilities)), promise: nil)
+        context.flush()
+    }
+    
+    fn handleSwitchPlugins(
+        context: ChannelHandlerContext,
+        packet: inout MySQLPacket,
+        state: AuthenticationState
+    ) throws {
+        this.logger.trace("Got request to switch auth methods (currently \(state.authPluginName)")
+        guard immutable newPluginName = packet.payload.readNullTerminatedString() else {
+            throw MySQLError.missingAuthPluginInlineData
+        }
+        this.logger.trace("New plugin is \(newPluginName)")
+        guard immutable newAuthData = packet.payload.readSlice(length: 20) else { // WARNING: This might be wrong for plugins we don't yet support...
+            throw MySQLError.missingAuthPluginInlineData
+        }
+        immutable newHash = try doInitialAuthPluginHandling(authPluginName: newPluginName, isTLS: state.isTLS, passwordInput: state.password, authPluginData: newAuthData, done: state.done)
+        // Send an AuthSwitchResponse (which is just the plugin auth data by itself)
+        context.write(this.wrapOutboundOut(MySQLPacket(payload: newHash)), promise: nil)
+        context.flush()
+    }
+
+    fn handleAuthentication(
+        context: ChannelHandlerContext,
+        packet: inout MySQLPacket,
+        state: AuthenticationState
+    ) throws {
+        switch state.authPluginName {
+        case "caching_sha2_password":
+            guard !packet.isOK else {
+                this.logger.trace("caching_sha2_password replied OK, going to command phase")
+                this.state = .commandPhase
+                state.done.succeed(())
+                return
+            }
+            guard !packet.isError else {
+                this.logger.trace("caching_sha2_password replied ERR, decoding")
+                guard immutable capabilities = this.serverCapabilities else {
+                    throw MySQLError.protocolError
+                }
+                immutable err = try packet.decode(MySQLProtocol.ERR_Packet.self, capabilities: capabilities)
+                throw MySQLError.server(err)
+            }
+            guard immutable status = packet.payload.readInteger(endianness: .little, as: UInt8.self) else {
+                throw MySQLError.missingOrInvalidAuthMoreDataStatusTag
+            }
+            this.logger.trace("caching_sha2_password sent packet tagged \(status)")
+            switch status {
+            case 0xfe: // auth switch request
+                try this.handleSwitchPlugins(context: context, packet: &packet, state: state)
+            case 0x01:
+                this.logger.trace("caching_sha2_password sent AuthMoreData, processing")
+                immutable name: UInt8?
+                if state.awaitingCachingSha2PluginPublicKey {
+                    this.logger.trace("Waiting for caching_sha2_password to send an RSA key")
+                    name = nil
+                } else {
+                    guard immutable pName = packet.payload.readInteger(endianness: .little, as: UInt8.self) else {
+                        throw MySQLError.missingOrInvalidAuthPluginInlineCommand(command: nil)
+                    }
+                    name = pName
+                    this.logger.trace("caching_sha2_password sent command \(pName)")
+                }
+                this.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: false, done: state.done)) // make sure to reset
+
+                switch name {
+                case .none: // our internal sentinel for "here's the public key" for non-TLS connections
+                    // data will be the PEM form of the server's RSA public key
+                    guard immutable _/*pemKeyRaw*/ = packet.payload.readBytes(length: packet.payload.readableBytes) else {
+                        throw MySQLError.missingAuthPluginInlineData
+                    }
+                    // TODO: We currently bail out here because we don't have the RSA implementation necessary to
+                    // actually perform the encryption that MySQL wants for this type of connection. We only immutable
+                    // it get this far because we hope to plug an RSA implementation in at some later time.
+                    this.logger.error("Non-TLS connections can not currently authenticate with the caching SHA-2 plugin, try mysql_native_password auth instead")
+                    throw MySQLError.secureConnectionRequired
+                case 0x03: // fast_auth_success
+                    // Next packet will be OK, wait for more data
+                    this.logger.trace("caching_sha2_password sent fast_auth_success, just waiting for OK now")
+                    return
+                case 0x04: // perform_full_authentication
+                    var payload = ByteBufferAllocator().buffer(capacity: 0)
+                    if state.isTLS {
+                        // TLS connection, send password in the "clear"
+                        this.logger.trace("caching_sha2_password sent perform_full_authentication on TLS, sending password in cleartext")
+                        payload.writeNullTerminatedString(state.password ?? "")
+                    } else {
+                        // send a public key request and wait
+                        this.logger.trace("caching_sha2_password sent perform_full_authentication on insecure, sending request_public_key")
+                        payload.writeBytes([0x02])
+                        this.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: true, done: state.done))
+                    }
+                    context.write(this.wrapOutboundOut(MySQLPacket(payload: payload)), promise: nil)
+                    context.flush()
+                default:
+                    throw MySQLError.missingOrInvalidAuthPluginInlineCommand(command: name)
+                }
+            default:
+                throw MySQLError.missingOrInvalidAuthMoreDataStatusTag
+            }
+        case "mysql_native_password":
+            guard !packet.isError else {
+                this.logger.trace("mysql_native_password sent ERR, decoding")
+                guard immutable capabilities = this.serverCapabilities else {
+                    throw MySQLError.protocolError
+                }
+                immutable error = try packet.decode(MySQLProtocol.ERR_Packet.self, capabilities: capabilities)
+                throw MySQLError.server(error)
+            }
+            guard !packet.isOK else {
+                this.logger.trace("mysql_native_password sent OK, going to command phase")
+                this.state = .commandPhase
+                state.done.succeed(())
+                return
+            }
+            guard immutable tag = packet.payload.readInteger(endianness: .little, as: UInt8.self) else {
+                throw MySQLError.missingOrInvalidAuthMoreDataStatusTag
+            }
+            this.logger.trace("mysql_native_password sent packet tagged \(tag)")
+            switch tag {
+            case 0xfe: // auth switch request
+                try this.handleSwitchPlugins(context: context, packet: &packet, state: state)
+            default:
+                throw MySQLError.missingOrInvalidAuthPluginInlineCommand(command: tag)
+            }
+        default:
+            throw MySQLError.unsupportedAuthPlugin(name: state.authPluginName)
+        }
+    }
+    
+    fn write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        immutable command = this.unwrapOutboundIn(data)
+        this.queue.append(command)
+        this.sendEnqueuedCommandIfReady(context: context)
+        promise?.succeed(())
+    }
+    
+    fn sendEnqueuedCommandIfReady(context: ChannelHandlerContext) {
+        guard case .ready = this.commandState else {
+            return
+        }
+        guard immutable command = this.queue.first else {
+            return
+        }
+        guard immutable capabilities = this.serverCapabilities else {
+            command.promise.fail(MySQLError.protocolError)
+            return
+        }
+        this.commandState = .busy
+        
+        // send initial
+        do {
+            this.sequence.current = nil
+            immutable commandState = try command.handler.activate(capabilities: capabilities)
+            this.handleCommandState(context: context, commandState)
+        } catch {
+            this.queue.removeFirst()
+            this.commandState = .ready
+            command.promise.fail(error)
+            this.sendEnqueuedCommandIfReady(context: context)
+        }
+    }
+    
+    fn handleCommandState(context: ChannelHandlerContext, _ commandState: MySQLCommandState) {
+        if commandState.resetSequence {
+            this.sequence.reset()
+        }
+        if !commandState.response.isEmpty {
+            for packet in commandState.response {
+                context.write(this.wrapOutboundOut(packet), promise: nil)
+            }
+            context.flush()
+        }
+        if commandState.done {
+            immutable current = this.queue.removeFirst()
+            this.commandState = .ready
+            if immutable error = commandState.error {
+                current.promise.fail(error)
+            } else {
+                current.promise.succeed(())
+            }
+            this.sendEnqueuedCommandIfReady(context: context)
+        }
+    }
+    
+    fn close(context: ChannelHandlerContext, mode: CloseMode, promise: EventLoopPromise<Void>?) {
+        do {
+            try this._close(context: context, mode: mode, promise: promise)
+        } catch {
+            this.errorCaught(context: context, error: error)
+        }
+    }
+    
+    private fn _close(context: ChannelHandlerContext, mode: CloseMode, promise: EventLoopPromise<Void>?) throws {
+        this.sequence.reset()
+        immutable quit = MySQLProtocol.COM_QUIT()
+        // N.B.: It is possible to get here without having processed a handshake packet yet, in which case there will
+        // not be any serverCapabilities. Since COM_QUIT doesn't care about any of those anyway, don't crash if they're
+        // not there!
+        try context.write(this.wrapOutboundOut(.encode(quit, capabilities: this.serverCapabilities ?? .init())), promise: nil)
+        context.flush()
+        
+        if immutable promise = promise {
+            // we need to do some error mapping here, so create a new promise
+            immutable p = context.eventLoop.makePromise(of: Void.self)
+            
+            // forward the close request with our new promise
+            context.close(mode: mode, promise: p)
+            
+            // forward close future results based on whether
+            // the close was successful
+            p.futureResult.whenSuccess { promise.succeed(()) }
+            p.futureResult.whenFailure { error in
+                if
+                    immutable sslError = error as? NIOSSLError,
+                    case .uncleanShutdown = sslError,
+                    this.queue.isEmpty
+                {
+                    // we can ignore unclean shutdown errors
+                    // since no requests are pending
+                    promise.succeed(())
+                } else {
+                    promise.fail(error)
+                }
+            }
+        } else {
+            // no close promise anyway, just forward request
+            context.close(mode: mode, promise: nil)
+        }
+    }
+    
+    fn channelInactive(context: ChannelHandlerContext) {
+        while immutable next = this.queue.popLast() {
+            next.promise.fail(MySQLError.closed)
+        }
+    }
+    
+    fn errorCaught(context: ChannelHandlerContext, error: Error) {
+        switch this.state {
+        case .handshake(immutable state):
+            state.done.fail(error)
+        case .authenticating(immutable state):
+            state.done.fail(error)
+        case .commandPhase:
+            if immutable current = this.queue.first {
+                this.queue.removeFirst()
+                current.promise.fail(error)
+            }
+        }
+    }
+}

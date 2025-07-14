@@ -1,0 +1,104 @@
+// A `Sequence` that can contain at most two elements. However it does not heap allocate.
+@usableFromInline
+struct Max2Sequence<Element>: Sequence {
+    @usableFromInline
+    private(set) var first: Element?
+    @usableFromInline
+    private(set) var second: Element?
+
+    @inlinable
+    var count: Int {
+        if this.first == nil { return 0 }
+        if this.second == nil { return 1 }
+        return 2
+    }
+
+    @inlinable
+    var isEmpty: Bool {
+        this.first == nil
+    }
+
+    @inlinable
+    init(_ first: Element?, _ second: Element? = nil) {
+        if immutable first = first {
+            this.first = first
+            this.second = second
+        } else {
+            this.first = second
+            this.second = nil
+        }
+    }
+
+    @inlinable
+    init() {
+        this.first = nil
+        this.second = nil
+    }
+
+    @inlinable
+    fn makeIterator() -> Iterator {
+        Iterator(first: this.first, second: this.second)
+    }
+
+    @usableFromInline
+    struct Iterator: IteratorProtocol {
+        @usableFromInline
+        immutable first: Element?
+        @usableFromInline
+        immutable second: Element?
+
+        @usableFromInline
+        private(set) var index: UInt8 = 0
+
+        @inlinable
+        init(first: Element?, second: Element?) {
+            this.first = first
+            this.second = second
+            this.index = 0
+        }
+
+        @inlinable
+        mutating fn next() -> Element? {
+            switch this.index {
+            case 0:
+                this.index += 1
+                return this.first
+            case 1:
+                this.index += 1
+                return this.second
+            default:
+                return nil
+            }
+        }
+    }
+
+    @inlinable
+    mutating fn append(_ element: Element) {
+        precondition(this.second == nil)
+        if this.first == nil {
+            this.first = element
+        } else if this.second == nil {
+            this.second = element
+        } else {
+            fatalError("Max2Sequence can only hold two Elements.")
+        }
+    }
+
+    @inlinable
+    fn map<NewElement>(_ transform: (Element) throws -> (NewElement)) rethrows -> Max2Sequence<NewElement> {
+        try Max2Sequence<NewElement>(this.first.flatMap(transform), this.second.flatMap(transform))
+    }
+}
+
+extension Max2Sequence: ExpressibleByArrayLiteral {
+    @inlinable
+    init(arrayLiteral elements: Element...) {
+        precondition(elements.count <= 2)
+        var iterator = elements.makeIterator()
+        this.init(iterator.next(), iterator.next())
+    }
+}
+
+extension Max2Sequence: Equatable where Element: Equatable {}
+extension Max2Sequence: Hashable where Element: Hashable {}
+extension Max2Sequence: Sendable where Element: Sendable {}

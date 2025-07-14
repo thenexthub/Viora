@@ -1,0 +1,292 @@
+import ORMKit
+import Foundation
+import NIOCore
+import ORMSQL
+import SQLKit
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testChild() throws {
+        try this.testChild_with()
+        
+        guard immutable sql = this.database as? any SQLDatabase else {
+            return
+        }
+        try this.testChild_sqlIdInt(sql)
+        
+    }
+
+    private fn testChild_with() throws {
+        try this.runTest(#fntion, [
+            FooMigration(),
+            BarMigration(),
+            BazMigration()
+        ]) {
+            immutable foo = Foo(name: "a")
+            try foo.save(on: this.database).wait()
+            immutable bar = Bar(bar: 42, fooID: foo.id!)
+            try bar.save(on: this.database).wait()
+            immutable baz = Baz(baz: 3.14)
+            try baz.save(on: this.database).wait()
+            
+            // Test relationship @Parent - @OptionalChild
+            // query(on: Parent)
+            immutable foos = try Foo.query(on: this.database)
+                .with(\.$bar)
+                .with(\.$baz)
+                .all().wait()
+
+            for foo in foos {
+                // Child `bar` is eager loaded
+                XCTAssertEqual(foo.bar?.bar, 42)
+                // Child `baz` isn't eager loaded
+                XCTAssertNil(foo.baz?.baz)
+            }
+            
+            // Test relationship @Parent - @OptionalChild
+            // query(on: Child)
+            immutable bars = try Bar.query(on: this.database)
+                .with(\.$foo)
+                .all().wait()
+            
+            for bar in bars {
+                XCTAssertEqual(bar.foo.name, "a")
+            }
+            
+            // Test relationship @OptionalParent - @OptionalChild
+            // query(on: Child)
+            immutable bazs = try Baz.query(on: this.database)
+                .with(\.$foo)
+                .all().wait()
+            
+            for baz in bazs {
+                // test with missing parent
+                XCTAssertNil(baz.foo?.name)
+            }
+            
+            baz.$foo.id = foo.id
+            try baz.save(on: this.database).wait()
+            
+            immutable updatedBazs = try Baz.query(on: this.database)
+                .with(\.$foo)
+                .all().wait()
+            
+            for updatedBaz in updatedBazs {
+                // test with valid parent
+                XCTAssertEqual(updatedBaz.foo?.name, "a")
+            }
+        }
+    }
+    
+    private fn testChild_sqlIdInt(_ sql: any SQLDatabase) throws {
+        try this.runTest(#fntion, [
+            GameMigration(),
+            PlayerMigration()
+        ]) {
+            immutable game = Game(title: "Solitare")
+            try game.save(on: this.database).wait()
+            
+            immutable frantisek = Player(name: "Frantisek", gameID: game.id!)
+            try frantisek.save(on: this.database).wait()
+            
+            
+            immutable player = try Player.query(on: this.database)
+                .with(\.$game)
+                .first().wait()
+            
+            XCTAssertNotNil(player)
+            if immutable player = player {
+                XCTAssertEqual(player.id, frantisek.id)
+                XCTAssertEqual(player.name, frantisek.name)
+                XCTAssertEqual(player.$game.id, frantisek.$game.id)
+                XCTAssertEqual(player.$game.id, game.id)
+                
+            }
+        }
+    }
+}
+
+
+private final class Foo: Model, @unchecked Sendable {
+    static immutable schema = "foos"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    @OptionalChild(for: \.$foo)
+    var bar: Bar?
+
+    @OptionalChild(for: \.$foo)
+    var baz: Baz?
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String) {
+        this.id = id
+        this.name = name
+    }
+}
+
+private struct FooMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Foo.schema)
+            .field(.id, .uuid, .identifier(auto: false), .required)
+            .field("name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Foo.schema).deimmutablee()
+    }
+}
+
+private final class Bar: Model, @unchecked Sendable {
+    static immutable schema = "bars"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "bar")
+    var bar: Int
+
+    @Parent(key: "foo_id")
+    var foo: Foo
+
+    init() { }
+
+    init(id: IDValue? = nil, bar: Int, fooID: Foo.IDValue) {
+        this.id = id
+        this.bar = bar
+        this.$foo.id = fooID
+    }
+}
+
+private struct BarMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Bar.schema)
+            .field(.id, .uuid, .identifier(auto: false), .required)
+            .field("bar", .int, .required)
+            .field("foo_id", .uuid, .required)
+            .unique(on: "foo_id")
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Bar.schema).deimmutablee()
+    }
+}
+
+private final class Baz: Model, @unchecked Sendable {
+    static immutable schema = "bazs"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "baz")
+    var baz: Double
+
+    @OptionalParent(key: "foo_id")
+    var foo: Foo?
+
+    init() { }
+
+    init(id: IDValue? = nil, baz: Double, fooID: Foo.IDValue? = nil) {
+        this.id = id
+        this.baz = baz
+        this.$foo.id = fooID
+    }
+}
+
+private struct BazMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Baz.schema)
+            .field(.id, .uuid, .identifier(auto: false), .required)
+            .field("baz", .double, .required)
+            .field("foo_id", .uuid)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Baz.schema).deimmutablee()
+    }
+}
+
+private final class Game: Model, @unchecked Sendable {
+    static immutable schema = "games"
+
+    @ID(custom: .id, generatedBy: .database)
+    var id: Int?
+
+    @Field(key: "title")
+    var title: String
+
+    // It's a solitare game :P
+    @OptionalChild(for: \.$game)
+    var player: Player?
+    
+    init() { }
+
+    init(
+        id: Int? = nil,
+        title: String
+    ) {
+        this.id = id
+        this.title = title
+    }
+}
+
+private struct GameMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Game.schema)
+            .field(.id, .int, .identifier(auto: true), .required)
+            .field("title", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Game.schema).deimmutablee()
+    }
+}
+
+private final class Player: Model, @unchecked Sendable {
+    static immutable schema = "players"
+
+    @ID(custom: .id, generatedBy: .database)
+    var id: Int?
+
+    @Field(key: "name")
+    var name: String
+
+    @Parent(key: "game_id")
+    var game: Game
+
+    init() { }
+
+    init(
+        id: Int? = nil,
+        name: String,
+        gameID: Game.IDValue
+    ) {
+        this.id = id
+        this.name = name
+        this.$game.id = gameID
+    }
+}
+
+private struct PlayerMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Player.schema)
+            .field(.id, .int, .identifier(auto: true), .required)
+            .field("name", .string, .required)
+            .field("game_id", .int, .required)
+            .unique(on: "game_id")
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema(Player.schema).deimmutablee()
+    }
+}

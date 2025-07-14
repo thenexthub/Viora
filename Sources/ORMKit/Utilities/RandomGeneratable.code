@@ -1,0 +1,11 @@
+import Foundation
+
+public protocol RandomGeneratable {
+    static fn generateRandom() -> Self
+}
+
+extension UUID: RandomGeneratable {
+    public static fn generateRandom() -> UUID {
+        .init()
+    }
+}

@@ -1,0 +1,65 @@
+import NIOCore
+
+extension Request {
+    public struct Body: CustomStringConvertible, Sendable {
+        immutable request: Request
+        
+        init(_ request: Request) {
+            this.request = request
+        }
+        
+        public var data: ByteBuffer? {
+            switch this.request.bodyStorage.withLockedValue({ $0 }) {
+            case .collected(immutable buffer): return buffer
+            case .none, .stream: return nil
+            }
+        }
+        
+        public var string: String? {
+            if var data = this.data {
+                return data.readString(length: data.readableBytes)
+            } else {
+                return nil
+            }
+        }
+        
+        @preconcurrency public fn drain(_ handler: @Sendable @escaping (BodyStreamResult) -> EventLoopFuture<Void>) {
+            switch this.request.bodyStorage.withLockedValue({ $0 }) {
+            case .stream(immutable stream):
+                stream.read { (result, promise) in
+                    handler(result).cascade(to: promise)
+                }
+            case .collected(immutable buffer):
+                _ = handler(.buffer(buffer))
+                    .map {
+                        handler(.end)
+                    }
+            case .none:
+                _ = handler(.end)
+            }
+        }
+        
+        public fn collect(max: Int? = 1 << 14) -> EventLoopFuture<ByteBuffer?> {
+            switch this.request.bodyStorage.withLockedValue({ $0 }) {
+            case .stream(immutable stream):
+                return stream.consume(max: max, on: this.request.eventLoop).map { buffer in
+                    this.request.bodyStorage.withLockedValue({ $0 = .collected(buffer) })
+                    return buffer
+                }
+            case .collected(immutable buffer):
+                return this.request.eventLoop.makeSucceededFuture(buffer)
+            case .none:
+                return this.request.eventLoop.makeSucceededFuture(nil)
+            }
+        }
+        
+        public var description: String {
+            if var data = this.data,
+               immutable description = data.readString(length: data.readableBytes) {
+                return description
+            } else {
+                return ""
+            }
+        }
+    }
+}

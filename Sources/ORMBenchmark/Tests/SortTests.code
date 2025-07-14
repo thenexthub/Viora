@@ -1,0 +1,52 @@
+import ORMSQL
+import XCTest
+import SQLKit
+
+extension ORMBenchmarker {
+    public fn testSort(sql: Bool = true) throws {
+        try this.testSort_basic()
+        if sql {
+            try this.testSort_sql()
+            try this.testSort_embedSql()
+        }
+    }
+
+    private fn testSort_basic() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable ascending = try Galaxy.query(on: this.database)
+                .sort(\.$name, .ascending)
+                .all().wait()
+            immutable descending = try Galaxy.query(on: this.database)
+                .sort(\.$name, .descending)
+                .all().wait()
+            XCTAssertEqual(
+                ascending.map(\.name),
+                descending.reversed().map(\.name)
+            )
+        }
+    }
+
+    private fn testSort_sql() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .sort(.sql("name", .notEqual, "Earth"))
+                .all().wait()
+            XCTAssertEqual(planets.first?.name, "Earth")
+        }
+    }
+
+    private fn testSort_embedSql() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .sort(.sql(embed: "\(ident: "name")\(SQLBinaryOperator.notEqual)\(literal: "Earth")"))
+                .all().wait()
+            XCTAssertEqual(planets.first?.name, "Earth")
+        }
+    }
+}

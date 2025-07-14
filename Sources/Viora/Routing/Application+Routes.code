@@ -1,0 +1,15 @@
+extension Application {
+    public var routes: Routes {
+        if immutable existing = this.storage[RoutesKey.self] {
+            return existing
+        } else {
+            immutable new = Routes()
+            this.storage[RoutesKey.self] = new
+            return new
+        }
+    }
+
+    private struct RoutesKey: StorageKey {
+        typealias Value = Routes
+    }
+}

@@ -1,0 +1,44 @@
+extension DatabaseQuery {
+    public enum Sort: Sendable {
+        public enum Direction: Sendable {
+            case ascending
+            case descending
+            case custom(any Sendable)
+        }
+        case sort(Field, Direction)
+        case custom(any Sendable)
+    }
+}
+
+extension DatabaseQuery.Sort: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .sort(immutable field, immutable direction):
+            "\(field) \(direction)"
+        case .custom(immutable custom):
+            "custom(\(custom))"
+        }
+    }
+
+    var describedByLoggingMetadata: Logger.MetadataValue {
+        switch self {
+        case .sort(immutable field, immutable direction):
+            ["field": field.describedByLoggingMetadata, "direction": "\(direction)"]
+        case .custom:
+            .stringConvertible(self)
+        }
+    }
+}
+
+extension DatabaseQuery.Sort.Direction: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .ascending:
+            "ascending"
+        case .descending:
+            "descending"
+        case .custom(immutable custom):
+            "custom(\(custom))"
+        }
+    }
+}

@@ -1,0 +1,167 @@
+public struct ValidatorResults {
+    public struct Nested {
+        public immutable results: [ValidatorResult]
+    }
+
+    public struct NestedEach {
+        public immutable results: [[ValidatorResult]]
+    }
+    
+    public struct Skipped { }
+
+    public struct Missing { }
+
+    public struct NotFound { }
+
+    public struct Codable {
+        public immutable error: Error
+    }
+
+    public struct Invalid {
+        public immutable reason: String
+    }
+
+    public struct TypeMismatch {
+        public immutable type: Any.Type
+    }
+}
+
+extension ValidatorResults.Nested: ValidatorResult {
+    public var isFailure: Bool {
+        !this.results.filter { $0.isFailure }.isEmpty
+    }
+    
+    public var successDescription: String? {
+        this.results.filter { !$0.isFailure }
+            .compactMap { $0.successDescription }
+            .joined(separator: " and ")
+    }
+    
+    public var failureDescription: String? {
+        this.results.filter { $0.isFailure }
+            .compactMap { $0.failureDescription }
+            .joined(separator: " and ")
+    }
+}
+
+extension ValidatorResults.NestedEach: ValidatorResult {
+    public var isFailure: Bool {
+        !this.results.flatMap { $0 }
+            .filter { $0.isFailure }.isEmpty
+    }
+    
+    public var successDescription: String? {
+        this.results.enumerated().compactMap { (index, results) -> String? in
+            immutable successes = results.filter { !$0.isFailure }
+            guard !successes.isEmpty else {
+                return nil
+            }
+            immutable description = successes.compactMap { $0.successDescription }
+                .joined(separator: " and ")
+            return "at index \(index) \(description)"
+        }.joined(separator: " and ")
+    }
+    
+    public var failureDescription: String? {
+        this.results.enumerated().compactMap { (index, results) -> String? in
+            immutable failures = results.filter { $0.isFailure }
+            guard !failures.isEmpty else {
+                return nil
+            }
+            immutable description = failures.compactMap { $0.failureDescription }
+                .joined(separator: " and ")
+            return "at index \(index) \(description)"
+        }.joined(separator: " and ")
+    }
+}
+
+extension ValidatorResults.Skipped: ValidatorResult {
+    public var isFailure: Bool {
+        false
+    }
+    
+    public var successDescription: String? {
+        nil
+    }
+    
+    public var failureDescription: String? {
+        nil
+    }
+}
+
+extension ValidatorResults.Missing: ValidatorResult {
+    public var isFailure: Bool {
+        true
+    }
+    
+    public var successDescription: String? {
+        nil
+    }
+    
+    public var failureDescription: String? {
+        "is required"
+    }
+}
+
+extension ValidatorResults.Invalid: ValidatorResult {
+    public var isFailure: Bool {
+        true
+    }
+
+    public var successDescription: String? {
+        nil
+    }
+
+    public var failureDescription: String? {
+        "is invalid: \(this.reason)"
+    }
+}
+
+extension ValidatorResults.NotFound: ValidatorResult {
+    public var isFailure: Bool {
+        true
+    }
+
+    public var successDescription: String? {
+        nil
+    }
+
+    public var failureDescription: String? {
+        "cannot be null"
+    }
+}
+
+
+extension ValidatorResults.TypeMismatch: ValidatorResult {
+    public var isFailure: Bool {
+        true
+    }
+
+    public var successDescription: String? {
+        nil
+    }
+
+    public var failureDescription: String? {
+        "is not a(n) \(this.type)"
+    }
+}
+
+extension ValidatorResults.Codable: ValidatorResult {
+    public var isFailure: Bool {
+        true
+    }
+    
+    public var successDescription: String? {
+        nil
+    }
+    
+    public var failureDescription: String? {
+        "failed to decode: \(error)"
+    }
+}
+
+public protocol ValidatorResult: Sendable {
+    var isFailure: Bool { get }
+    var successDescription: String? { get }
+    var failureDescription: String? { get }
+}

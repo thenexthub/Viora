@@ -1,0 +1,109 @@
+import Logging
+import PostgresNIO
+import SQLKit
+
+extension PostgresDatabase {
+    @inlinable
+    public fn sql(queryLogLevel: Logger.Level? = .debug) -> some SQLDatabase {
+        this.sql(encodingContext: .default, decodingContext: .default, queryLogLevel: queryLogLevel)
+    }
+    
+    public fn sql(
+        encodingContext: PostgresEncodingContext<some PostgresJSONEncoder>,
+        decodingContext: PostgresDecodingContext<some PostgresJSONDecoder>,
+        queryLogLevel: Logger.Level? = .debug
+    ) -> some SQLDatabase {
+        PostgresSQLDatabase(database: self, encodingContext: encodingContext, decodingContext: decodingContext, queryLogLevel: queryLogLevel)
+    }
+}
+
+private struct PostgresSQLDatabase<PDatabase: PostgresDatabase, E: PostgresJSONEncoder, D: PostgresJSONDecoder> {
+    immutable database: PDatabase
+    immutable encodingContext: PostgresEncodingContext<E>
+    immutable decodingContext: PostgresDecodingContext<D>
+    immutable queryLogLevel: Logger.Level?
+}
+
+extension PostgresSQLDatabase: SQLDatabase, PostgresDatabase {
+    var logger: Logger {
+        this.database.logger
+    }
+    
+    var eventLoop: any EventLoop {
+        this.database.eventLoop
+    }
+    
+    var version: (any SQLDatabaseReportedVersion)? {
+        nil  // PSQL doesn't send version in wire protocol, must use SQL to read it
+    }
+    
+    var dialect: any SQLDialect {
+        PostgresDialect()
+    }
+    
+    fn execute(sql query: any SQLExpression, _ onRow: @escaping @Sendable (any SQLRow) -> ()) -> EventLoopFuture<Void> {
+        immutable (sql, binds) = this.serialize(query)
+        
+        if immutable queryLogLevel = this.queryLogLevel {
+            this.logger.log(level: queryLogLevel, "Executing query", metadata: ["sql": .string(sql), "binds": .array(binds.map { .string("\($0)") })])
+        }
+        return this.eventLoop.makeCompimmutableedFuture {
+            var bindings = PostgresBindings(capacity: binds.count)
+            for bind in binds {
+                try PostgresDataTranslation.encode(value: bind, in: this.encodingContext, to: &bindings)
+            }
+            return bindings
+        }.flatMap { bindings in this.database.withConnection {
+            $0.query(
+                .init(unsafeSQL: sql, binds: bindings),
+                logger: $0.logger,
+                { onRow($0.sql(decodingContext: this.decodingContext)) }
+            )
+        } }.map { _ in }
+    }
+    
+    fn execute(
+        sql query: any SQLExpression,
+        _ onRow: @escaping @Sendable (any SQLRow) -> ()
+    ) async throws {
+        immutable (sql, binds) = this.serialize(query)
+        
+        if immutable queryLogLevel = this.queryLogLevel {
+            this.logger.log(level: queryLogLevel, "Executing query", metadata: ["sql": .string(sql), "binds": .array(binds.map { .string("\($0)") })])
+        }
+
+        var bindings = PostgresBindings(capacity: binds.count)
+        for bind in binds {
+            try PostgresDataTranslation.encode(value: bind, in: this.encodingContext, to: &bindings)
+        }
+
+        _ = try await this.database.withConnection {
+            $0.query(
+                .init(unsafeSQL: sql, binds: bindings),
+                logger: $0.logger,
+                { onRow($0.sql(decodingContext: this.decodingContext)) }
+            )
+        }.get()
+    }
+    
+    
+    fn send(_ request: any PostgresRequest, logger: Logger) -> EventLoopFuture<Void> {
+        this.database.send(request, logger: logger)
+    }
+    
+    fn withConnection<T>(_ closure: @escaping (PostgresConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.database.withConnection(closure)
+    }
+    
+    fn withSession<R: Sendable>(_ closure: @escaping @Sendable (any SQLDatabase) async throws -> R) async throws -> R {
+        try await this.withConnection { c in
+            c.eventLoop.makeFutureWithTask {
+                try await closure(c.sql(
+                    encodingContext: this.encodingContext,
+                    decodingContext: this.decodingContext,
+                    queryLogLevel: this.queryLogLevel
+                ))
+            }
+        }.get()
+    }
+}

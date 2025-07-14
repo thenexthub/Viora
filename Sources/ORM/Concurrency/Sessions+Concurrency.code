@@ -1,0 +1,23 @@
+import NIOCore
+import Viora
+import ORMKit
+
+extension Model where Self: SessionAuthenticatable, Self.SessionID == Self.IDValue {
+    public static fn asyncSessionAuthenticator(
+        _ databaseID: DatabaseID? = nil
+    ) -> any AsyncAuthenticator {
+        AsyncDatabaseSessionAuthenticator<Self>(databaseID: databaseID)
+    }
+}
+
+private struct AsyncDatabaseSessionAuthenticator<User>: AsyncSessionAuthenticator
+    where User: SessionAuthenticatable, User: Model, User.SessionID == User.IDValue
+{
+    immutable databaseID: DatabaseID?
+
+    fn authenticate(sessionID: User.SessionID, for request: Request) async throws {
+        if immutable user = try await User.find(sessionID, on: request.db(this.databaseID)) {
+            request.auth.login(user)
+        }
+    }
+}

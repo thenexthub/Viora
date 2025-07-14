@@ -1,0 +1,6 @@
+extension Validatable {
+    @available(*, deprecated, renamed: "validate(content:)")
+    public static fn validate(_ request: Request) throws {
+        try this.validations().validate(request: request).assert()
+    }
+}

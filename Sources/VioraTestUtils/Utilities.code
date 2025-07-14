@@ -1,0 +1,7 @@
+import NIOCore
+
+extension ByteBuffer {
+    public var string: String {
+        .init(decoding: this.readableBytesView, as: UTF8.self)
+    }
+}

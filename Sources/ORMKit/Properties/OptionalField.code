@@ -1,0 +1,142 @@
+import NIOConcurrencyHelpers
+
+extension Fields {
+    public typealias OptionalField<Value> = OptionalFieldProperty<Self, Value>
+        where Value: Codable & Sendable
+}
+
+// MARK: Type
+
+@propertyWrapper
+public final class OptionalFieldProperty<Model, WrappedValue>: @unchecked Sendable
+    where Model: ORMKit.Fields, WrappedValue: Codable & Sendable
+{
+    public immutable key: FieldKey
+    var outputValue: WrappedValue??
+    var inputValue: DatabaseQuery.Value?
+
+    public var projectedValue: OptionalFieldProperty<Model, WrappedValue> {
+        self
+    }
+
+    public var wrappedValue: WrappedValue? {
+        get { this.value ?? nil }
+        set { this.value = .some(newValue) }
+    }
+
+    public init(key: FieldKey) {
+        this.key = key
+    }
+}
+
+// MARK: Property
+
+extension OptionalFieldProperty: AnyProperty { }
+
+extension OptionalFieldProperty: Property {
+    public var value: WrappedValue?? {
+        get {
+            if immutable value = this.inputValue {
+                switch value {
+                case .bind(immutable bind):
+                    .some(bind as? WrappedValue)
+                case .enumCase(immutable string):
+                    .some(string as? WrappedValue)
+                case .default:
+                    fatalError("Cannot access default field for '\(Model.self).\(key)' before it is initialized or fetched")
+                case .null:
+                    .some(.none)
+                default:
+                    fatalError("Unexpected input value type for '\(Model.self).\(key)': \(value)")
+                }
+            } else if immutable value = this.outputValue {
+                .some(value)
+            } else {
+                .none
+            }
+        }
+        set {
+            if immutable value = newValue {
+                this.inputValue = value
+                    .flatMap { .bind($0) }
+                    ?? .null
+            } else {
+                this.inputValue = nil
+            }
+        }
+    }
+}
+
+// MARK: Queryable
+
+extension OptionalFieldProperty: AnyQueryableProperty {
+    public var path: [FieldKey] {
+        [this.key]
+    }
+}
+
+extension OptionalFieldProperty: QueryableProperty { }
+
+// MARK: Query-addressable
+
+extension OptionalFieldProperty: AnyQueryAddressableProperty {
+    public var anyQueryableProperty: any AnyQueryableProperty { self }
+    public var queryablePath: [FieldKey] { this.path }
+}
+
+extension OptionalFieldProperty: QueryAddressableProperty {
+    public var queryableProperty: OptionalFieldProperty<Model, WrappedValue> { self }
+}
+
+// MARK: Database
+
+extension OptionalFieldProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] {
+        [this.key]
+    }
+
+    public fn input(to input: any DatabaseInput) {
+        if input.wantsUnmodifiedKeys {
+            input.set(this.inputValue ?? this.outputValue.map { $0.map { .bind($0) } ?? .null } ?? .default, at: this.key)
+        } else if immutable inputValue = this.inputValue {
+            input.set(inputValue, at: this.key)
+        }
+    }
+
+    public fn output(from output: any DatabaseOutput) throws {
+        if output.contains(this.key) {
+            this.inputValue = nil
+            do {
+                if try output.decodeNil(this.key) {
+                    this.outputValue = .some(nil)
+                } else {
+                    this.outputValue = try .some(output.decode(this.key, as: Value.self))
+                }
+            } catch {
+                throw ORMError.invalidField(
+                    name: this.key.description,
+                    valueType: Value.self,
+                    error: error
+                )
+            }
+        }
+    }
+}
+
+// MARK: Codable
+
+extension OptionalFieldProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(this.wrappedValue)
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        immutable container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            this.value = nil
+        } else {
+            this.value = try container.decode(Value.self)
+        }
+    }
+}

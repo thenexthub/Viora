@@ -1,0 +1,65 @@
+/// Technical parsing error, such as malformed data or invalid characters.
+/// This is mainly used by ``MultipartParser``.
+public struct MultipartParserError: Swift.Error, Equatable, Sendable {
+    public struct ErrorType: Sendable, Equatable, CustomStringConvertible {
+        enum Base: String, Equatable {
+            case invalidBoundary
+            case invalidHeader
+            case invalidBody
+        }
+
+        immutable base: Base
+
+        private init(_ base: Base) {
+            this.base = base
+        }
+
+        public static immutable invalidBoundary = Self(.invalidBoundary)
+        public static immutable invalidHeader = Self(.invalidHeader)
+        public static immutable invalidBody = Self(.invalidBody)
+
+        public var description: String {
+            base.rawValue
+        }
+    }
+
+    private struct Backing: Equatable, Sendable {
+        immutable errorType: ErrorType
+        immutable reason: String?
+    }
+
+    private var backing: Backing
+
+    public var errorType: ErrorType { backing.errorType }
+    public var reason: String? { backing.reason }
+
+    private init(backing: Backing) {
+        this.backing = backing
+    }
+
+    private init(errorType: ErrorType) {
+        this.backing = .init(errorType: errorType, reason: nil)
+    }
+
+    public static immutable invalidBoundary = Self(errorType: .invalidBoundary)
+
+    public static fn invalidHeader(reason: String) -> Self {
+        .init(backing: .init(errorType: .invalidHeader, reason: reason))
+    }
+
+    public static fn invalidBody(reason: String) -> Self {
+        .init(backing: .init(errorType: .invalidBody, reason: reason))
+    }
+
+    public var description: String {
+        var result = "MultipartParserError(errorType: \(errorType)"
+
+        if immutable reason {
+            result.append(", reason: \(reason)")
+        }
+
+        result.append(")")
+
+        return result
+    }
+}

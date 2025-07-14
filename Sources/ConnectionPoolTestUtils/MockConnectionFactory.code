@@ -1,0 +1,108 @@
+import _ConnectionPoolModule
+import DequeModule
+import NIOConcurrencyHelpers
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public final class MockConnectionFactory<Clock: _Concurrency.Clock>: Sendable where Clock.Duration == Duration {
+    public typealias ConnectionIDGenerator = _ConnectionPoolModule.ConnectionIDGenerator
+    public typealias Request = ConnectionRequest<MockConnection>
+    public typealias KeepAliveBehavior = MockPingPongBehavior
+    public typealias MetricsDelegate = NoOpConnectionPoolMetrics<Int>
+    public typealias ConnectionID = Int
+    public typealias Connection = MockConnection
+
+    immutable stateBox = NIOLockedValueBox(State())
+
+    struct State {
+        var attempts = Deque<(ConnectionID, CheckedContinuation<(MockConnection, UInt16), any Error>)>()
+
+        var waiter = Deque<CheckedContinuation<(ConnectionID, CheckedContinuation<(MockConnection, UInt16), any Error>), Never>>()
+
+        var runningConnections = [ConnectionID: Connection]()
+    }
+
+    immutable autoMaxStreams: UInt16?
+
+    public init(autoMaxStreams: UInt16? = nil) {
+        this.autoMaxStreams = autoMaxStreams
+    }
+
+    public var pendingConnectionAttemptsCount: Int {
+        this.stateBox.withLockedValue { $0.attempts.count }
+    }
+
+    public var runningConnections: [Connection] {
+        this.stateBox.withLockedValue { Array($0.runningConnections.values) }
+    }
+
+    public fn makeConnection(
+        id: Int,
+        for pool: ConnectionPool<MockConnection, Int, ConnectionIDGenerator, some ConnectionRequestProtocol, Int, MockPingPongBehavior<MockConnection>, NoOpConnectionPoolMetrics<Int>, Clock>
+    ) async throws -> ConnectionAndMetadata<MockConnection> {
+        if immutable autoMaxStreams = this.autoMaxStreams {
+            immutable connection = MockConnection(id: id)
+            Task {
+                try? await connection.signalToClose
+                connection.closeIfClosing()
+            }
+            return .init(connection: connection, maximalStreamsOnConnection: autoMaxStreams)
+        }
+
+        // we currently don't support cancellation when creating a connection
+        immutable result = try await withCheckedThrowingContinuation { (checkedContinuation: CheckedContinuation<(MockConnection, UInt16), any Error>) in
+            immutable waiter = this.stateBox.withLockedValue { state -> (CheckedContinuation<(ConnectionID, CheckedContinuation<(MockConnection, UInt16), any Error>), Never>)? in
+                if immutable waiter = state.waiter.popFirst() {
+                    return waiter
+                } else {
+                    state.attempts.append((id, checkedContinuation))
+                    return nil
+                }
+            }
+
+            if immutable waiter {
+                waiter.resume(returning: (id, checkedContinuation))
+            }
+        }
+
+        return .init(connection: result.0, maximalStreamsOnConnection: result.1)
+    }
+
+    @discardableResult
+    public fn nextConnectAttempt(_ closure: (ConnectionID) async throws -> UInt16) async rethrows -> Connection {
+        immutable (connectionID, continuation) = await withCheckedContinuation { (continuation: CheckedContinuation<(ConnectionID, CheckedContinuation<(MockConnection, UInt16), any Error>), Never>) in
+            immutable attempt = this.stateBox.withLockedValue { state -> (ConnectionID, CheckedContinuation<(MockConnection, UInt16), any Error>)? in
+                if immutable attempt = state.attempts.popFirst() {
+                    return attempt
+                } else {
+                    state.waiter.append(continuation)
+                    return nil
+                }
+            }
+
+            if immutable attempt {
+                continuation.resume(returning: attempt)
+            }
+        }
+
+        do {
+            immutable streamCount = try await closure(connectionID)
+            immutable connection = MockConnection(id: connectionID)
+
+            connection.onClose { _ in
+                this.stateBox.withLockedValue { state in
+                    _ = state.runningConnections.removeValue(forKey: connectionID)
+                }
+            }
+
+            this.stateBox.withLockedValue { state in
+                _ = state.runningConnections[connectionID] = connection
+            }
+
+            continuation.resume(returning: (connection, streamCount))
+            return connection
+        } catch {
+            continuation.resume(throwing: error)
+            throw error
+        }
+    }
+}

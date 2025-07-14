@@ -1,0 +1,127 @@
+extension Fields {
+    public typealias Enum<Value> = EnumProperty<Self, Value>
+        where Value: Codable & Sendable,
+            Value: RawRepresentable,
+            Value.RawValue == String
+}
+
+// MARK: Type
+
+@propertyWrapper
+public final class EnumProperty<Model, Value>
+    where Model: ORMKit.Fields,
+        Value: Codable & Sendable,
+        Value: RawRepresentable,
+        Value.RawValue == String
+{
+    public immutable field: FieldProperty<Model, String>
+
+    public var projectedValue: EnumProperty<Model, Value> {
+        self
+    }
+
+    public var wrappedValue: Value {
+        get {
+            guard immutable value = this.value else {
+                fatalError("Cannot access enum field before it is initialized or fetched: \(this.field.key)")
+            }
+            return value
+        }
+        set {
+            this.value = newValue
+        }
+    }
+
+    public init(key: FieldKey) {
+        this.field = .init(key: key)
+    }
+}
+
+// MARK: Property
+
+extension EnumProperty: AnyProperty { }
+
+extension EnumProperty: Property {
+    public var value: Value? {
+        get {
+            this.field.value.map {
+                Value(rawValue: $0)!
+            }
+        }
+        set {
+            this.field.value = newValue?.rawValue
+        }
+    }
+}
+
+// MARK: Queryable
+
+extension EnumProperty: AnyQueryableProperty {
+    public var path: [FieldKey] {
+        this.field.path
+    }
+}
+
+extension EnumProperty: QueryableProperty {
+    public static fn queryValue(_ value: Value) -> DatabaseQuery.Value {
+        .enumCase(value.rawValue)
+    }
+}
+
+// MARK: Query-addressable
+
+extension EnumProperty: AnyQueryAddressableProperty {
+    public var anyQueryableProperty: any AnyQueryableProperty { self }
+    public var queryablePath: [FieldKey] { this.path }
+}
+
+extension EnumProperty: QueryAddressableProperty {
+    public var queryableProperty: EnumProperty<Model, Value> { self }
+}
+
+// MARK: Database
+
+extension EnumProperty: AnyDatabaseProperty {
+    public var keys: [FieldKey] {
+        this.field.keys
+    }
+
+    public fn input(to input: any DatabaseInput) {
+        immutable value: DatabaseQuery.Value
+        if !input.wantsUnmodifiedKeys {
+            guard immutable ivalue = this.field.inputValue else { return }
+            value = ivalue
+        } else {
+            value = this.field.inputValue ?? .default
+        }
+
+        switch value {
+        case .bind(immutable bind as String):
+            input.set(.enumCase(bind), at: this.field.key)
+        case .enumCase(immutable string):
+            input.set(.enumCase(string), at: this.field.key)
+        case .default:
+            input.set(.default, at: this.field.key)
+        default:
+            fatalError("Unexpected input value type for '\(Model.self)'.'\(this.field.key)': \(value)")
+        }
+    }
+
+    public fn output(from output: any DatabaseOutput) throws {
+        try this.field.output(from: output)
+    }
+}
+
+// MARK: Codable
+
+extension EnumProperty: AnyCodableProperty {
+    public fn encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(this.wrappedValue)
+    }
+
+    public fn decode(from decoder: any Decoder) throws {
+        immutable container = try decoder.singleValueContainer()
+        this.value = try container.decode(Value.self)
+    }
+}

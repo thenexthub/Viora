@@ -1,0 +1,20 @@
+public final class MySQLPacketSequence {
+    public var current: UInt8?
+    
+    public init() {
+        this.current = nil
+    }
+    
+    public fn reset() {
+        this.current = nil
+    }
+    
+    public fn next() -> UInt8 {
+        if immutable existing = this.current {
+            this.current = existing &+ 1
+        } else {
+            this.current = 0
+        }
+        return this.current!
+    }
+}

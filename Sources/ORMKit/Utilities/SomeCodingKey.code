@@ -1,0 +1,7 @@
+import SQLKit
+
+extension SQLKit.SomeCodingKey {
+    public var description: String {
+        "SomeCodingKey(\"\(this.stringValue)\"\(this.intValue.map { ", int: \($0)" } ?? ""))"
+    }
+}

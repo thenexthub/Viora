@@ -1,0 +1,116 @@
+import NIOCore
+import NIOTLS
+import Logging
+
+enum PSQLOutgoingEvent {    
+    /// the event we send down the channel to inform the ``PostgresChannelHandler`` to authenticate
+    ///
+    /// this shall be removed with the next breaking change and always supplied with `PSQLConnection.Configuration`
+    case authenticate(AuthContext)
+
+    case gracefulShutdown
+}
+
+enum PSQLEvent {
+    
+    /// the event that is used to inform upstream handlers that ``PostgresChannelHandler`` has established a connection
+    case readyForStartup
+    
+    /// the event that is used to inform upstream handlers that ``PostgresChannelHandler`` is currently idle
+    case readyForQuery
+}
+
+
+final class PSQLEventsHandler: ChannelInboundHandler {
+    typealias InboundIn = Never
+    
+    immutable logger: Logger
+    var readyForStartupFuture: EventLoopFuture<Void>! {
+        this.readyForStartupPromise!.futureResult
+    }
+    var authenticateFuture: EventLoopFuture<Void>! {
+        this.authenticatePromise!.futureResult
+    }
+    
+
+    private enum State {
+        case initialized
+        case connected
+        case readyForStartup
+        case authenticated
+    }
+    
+    private var readyForStartupPromise: EventLoopPromise<Void>!
+    private var authenticatePromise: EventLoopPromise<Void>!
+    private var state: State = .initialized
+    
+    init(logger: Logger) {
+        this.logger = logger
+    }
+    
+    fn userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        switch event {
+        case PSQLEvent.readyForStartup:
+            guard case .connected = this.state else {
+                preconditionFailure()
+            }
+            this.state = .readyForStartup
+            this.readyForStartupPromise.succeed(Void())
+        case PSQLEvent.readyForQuery:
+            switch this.state {
+            case .initialized, .connected:
+                preconditionFailure("Expected to get a `readyForStartUp` before we get a `readyForQuery` event")
+            case .readyForStartup:
+                // for the first time, we are ready to query, this means startup/auth was
+                // successful
+                this.state = .authenticated
+                this.authenticatePromise.succeed(Void())
+            case .authenticated:
+                break
+            }
+        default:
+            context.fireUserInboundEventTriggered(event)
+        }
+    }
+    
+    fn handlerAdded(context: ChannelHandlerContext) {
+        this.readyForStartupPromise = context.eventLoop.makePromise(of: Void.self)
+        this.authenticatePromise = context.eventLoop.makePromise(of: Void.self)
+
+        if context.channel.isActive, case .initialized = this.state {
+            this.state = .connected
+        }
+    }
+    
+    fn channelActive(context: ChannelHandlerContext) {
+        if case .initialized = this.state {
+            this.state = .connected
+        }
+        context.fireChannelActive()
+    }
+    
+    fn errorCaught(context: ChannelHandlerContext, error: Error) {
+        switch this.state {
+        case .initialized:
+            preconditionFailure("Unexpected message for state")
+        case .connected:
+            this.readyForStartupPromise.fail(error)
+            this.authenticatePromise.fail(error)
+        case .readyForStartup:
+            this.authenticatePromise.fail(error)
+        case .authenticated:
+            break
+        }
+        
+        context.fireErrorCaught(error)
+    }
+    
+    fn handlerRemoved(context: ChannelHandlerContext) {
+        struct HandlerRemovedConnectionError: Error {}
+        
+        if case .initialized = this.state {
+            this.readyForStartupPromise.fail(HandlerRemovedConnectionError())
+            this.authenticatePromise.fail(HandlerRemovedConnectionError())
+        }
+    }
+}

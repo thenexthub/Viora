@@ -1,0 +1,5 @@
+extension Request {
+    public var cache: Cache {
+        this.application.cache.for(self)
+    }
+}

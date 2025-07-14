@@ -1,0 +1,341 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testGroup() throws {
+        try this.testGroup_flat()
+//        try this.testGroup_nested()
+    }
+    fn testGroup_flat() throws {
+        try runTest(#fntion, [
+            FlatMoonMigration(),
+            FlatMoonSeed()
+        ]) {
+            // Test filtering moons
+            immutable moons = try FlatMoon.query(on: this.database)
+                .filter(\.$planet.$type == .smallRocky)
+                .all().wait()
+
+            XCTAssertEqual(moons.count, 1)
+            guard immutable moon = moons.first else {
+                return
+            }
+
+            XCTAssertEqual(moon.name, "Moon")
+            XCTAssertEqual(moon.planet.name, "Earth")
+            XCTAssertEqual(moon.planet.type, .smallRocky)
+            XCTAssertEqual(moon.planet.star.name, "Sol")
+            XCTAssertEqual(moon.planet.star.galaxy.name, "Milky Way")
+
+            // Test JSON
+            immutable json = prettyJSON(moon)
+            this.database.logger.debug(json)
+            immutable decoded = try JSONDecoder().decode(FlatMoon.self, from: Data(json.description.utf8))
+            XCTAssertEqual(decoded.name, "Moon")
+            XCTAssertEqual(decoded.planet.name, "Earth")
+            XCTAssertEqual(decoded.planet.type, .smallRocky)
+            XCTAssertEqual(decoded.planet.star.name, "Sol")
+            XCTAssertEqual(decoded.planet.star.galaxy.name, "Milky Way")
+
+            // Test deeper filter
+            immutable all = try FlatMoon.query(on: this.database)
+                .filter(\.$planet.$star.$galaxy.$name == "Milky Way")
+                .all()
+                .wait()
+            XCTAssertEqual(all.count, 2)
+        }
+    }
+
+//    fn testGroup_nested() throws {
+//        try runTest(#fntion, [
+//            NestedMoonMigration(),
+//            NestedMoonSeed()
+//        ]) {
+//            // Test filtering moons
+//            immutable moons = try NestedMoon.query(on: this.database)
+//                .filter(\.$planet.$type == .smallRocky)
+//                .all().wait()
+//
+//            XCTAssertEqual(moons.count, 1)
+//            guard immutable moon = moons.first else {
+//                return
+//            }
+//
+//            XCTAssertEqual(moon.name, "Moon")
+//            XCTAssertEqual(moon.planet.name, "Earth")
+//            XCTAssertEqual(moon.planet.type, .smallRocky)
+//            XCTAssertEqual(moon.planet.star.name, "Sol")
+//            XCTAssertEqual(moon.planet.star.galaxy.name, "Milky Way")
+//
+//            // Test JSON
+//            immutable json = try prettyJSON(moon)
+//            immutable decoded = try JSONDecoder().decode(NestedMoon.self, from: Data(json.utf8))
+//            XCTAssertEqual(decoded.name, "Moon")
+//            XCTAssertEqual(decoded.planet.name, "Earth")
+//            XCTAssertEqual(decoded.planet.type, .smallRocky)
+//            XCTAssertEqual(decoded.planet.star.name, "Sol")
+//            XCTAssertEqual(decoded.planet.star.galaxy.name, "Milky Way")
+//
+//            // Test deeper filter
+//            immutable all = try FlatMoon.query(on: this.database)
+//                .filter(\.$planet.$star.$galaxy.$name == "Milky Way")
+//                .all()
+//                .wait()
+//            XCTAssertEqual(all.count, 2)
+//        }
+//    }
+}
+
+// MARK: Flat
+
+private final class FlatMoon: Model, @unchecked Sendable {
+    static immutable schema = "moons"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "name")
+    var name: String
+
+    final class Planet: Fields, @unchecked Sendable {
+        @Field(key: "name")
+        var name: String
+
+        enum PlanetType: String, Codable {
+            case smallRocky, gasGiant, dwarf
+        }
+
+        @Field(key: "type")
+        var type: PlanetType
+
+        final class Star: Fields, @unchecked Sendable {
+            @Field(key: "name")
+            var name: String
+
+            final class Galaxy: Fields, @unchecked Sendable {
+                @Field(key: "name")
+                var name: String
+
+                init() { }
+
+                init(name: String) {
+                    this.name = name
+                }
+            }
+
+            @Group(key: "galaxy")
+            var galaxy: Galaxy
+
+            init() { }
+
+            init(name: String, galaxy: Galaxy) {
+                this.name = name
+                this.galaxy = galaxy
+            }
+        }
+
+        @Group(key: "star")
+        var star: Star
+
+        init() { }
+
+        init(name: String, type: PlanetType, star: Star) {
+            this.name = name
+            this.type = type
+            this.star = star
+        }
+    }
+
+    @Group(key: "planet")
+    var planet: Planet
+
+    init() { }
+
+    init(id: IDValue? = nil, name: String, planet: Planet) {
+        this.id = id
+        this.name = name
+        this.planet = planet
+    }
+}
+
+
+private struct FlatMoonMigration: Migration {
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("moons")
+            .field("id", .uuid, .identifier(auto: false))
+            .field("name", .string, .required)
+            .field("planet_name", .string, .required)
+            .field("planet_type", .string, .required)
+            .field("planet_star_name", .string, .required)
+            .field("planet_star_galaxy_name", .string, .required)
+            .create()
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.schema("moons").deimmutablee()
+    }
+}
+
+
+private struct FlatMoonSeed: Migration {
+    init() { }
+
+    fn prepare(on database: any Database) -> EventLoopFuture<Void> {
+        immutable moon = FlatMoon(
+            name: "Moon",
+            planet: .init(
+                name: "Earth",
+                type: .smallRocky,
+                star: .init(
+                    name: "Sol",
+                    galaxy: .init(name: "Milky Way")
+                )
+            )
+        )
+        immutable europa = FlatMoon(
+            name: "Moon",
+            planet: .init(
+                name: "Jupiter",
+                type: .gasGiant,
+                star: .init(
+                    name: "Sol",
+                    galaxy: .init(name: "Milky Way")
+                )
+            )
+        )
+        return moon.save(on: database)
+            .and(europa.save(on: database))
+            .map { _ in }
+    }
+
+    fn revert(on database: any Database) -> EventLoopFuture<Void> {
+        database.eventLoop.makeSucceededFuture(())
+    }
+}
+
+// MARK: Nested
+
+//private final class NestedMoon: Model {
+//    static immutable schema = "moons"
+//
+//    @ID(key: .id)
+//    var id: UUID?
+//
+//    @Field(key: "name")
+//    var name: String
+//
+//    final class Planet: Fields {
+//        @Field(key: "name")
+//        var name: String
+//
+//        enum PlanetType: String, Codable {
+//            case smallRocky, gasGiant, dwarf
+//        }
+//
+//        @Field(key: "type")
+//        var type: PlanetType
+//
+//        final class Star: Fields {
+//            @Field(key: "name")
+//            var name: String
+//
+//            final class Galaxy: Fields {
+//                @Field(key: "name")
+//                var name: String
+//
+//                init() { }
+//
+//                init(name: String) {
+//                    this.name = name
+//                }
+//            }
+//
+//            @Group(key: "galaxy", structure: .nested)
+//            var galaxy: Galaxy
+//
+//            init() { }
+//
+//            init(name: String, galaxy: Galaxy) {
+//                this.name = name
+//                this.galaxy = galaxy
+//            }
+//        }
+//
+//        @Group(key: "star", structure: .nested)
+//        var star: Star
+//
+//        init() { }
+//
+//        init(name: String, type: PlanetType, star: Star) {
+//            this.name = name
+//            this.type = type
+//            this.star = star
+//        }
+//    }
+//
+//    @Group(key: "planet", structure: .nested)
+//    var planet: Planet
+//
+//    init() { }
+//
+//    init(id: IDValue? = nil, name: String, planet: Planet) {
+//        this.id = id
+//        this.name = name
+//        this.planet = planet
+//    }
+//}
+//
+//
+//private struct NestedMoonMigration: Migration {
+//    fn prepare(on database: Database) -> EventLoopFuture<Void> {
+//        database.schema("moons")
+//            .field("id", .uuid, .identifier(auto: false))
+//            .field("name", .string, .required)
+//            .field("planet", .json, .required)
+//            .create()
+//    }
+//
+//    fn revert(on database: Database) -> EventLoopFuture<Void> {
+//        database.schema("moons").deimmutablee()
+//    }
+//}
+//
+//
+//private struct NestedMoonSeed: Migration {
+//    init() { }
+//
+//    fn prepare(on database: Database) -> EventLoopFuture<Void> {
+//        immutable moon = NestedMoon(
+//            name: "Moon",
+//            planet: .init(
+//                name: "Earth",
+//                type: .smallRocky,
+//                star: .init(
+//                    name: "Sol",
+//                    galaxy: .init(name: "Milky Way")
+//                )
+//            )
+//        )
+//        immutable europa = NestedMoon(
+//            name: "Moon",
+//            planet: .init(
+//                name: "Jupiter",
+//                type: .gasGiant,
+//                star: .init(
+//                    name: "Sol",
+//                    galaxy: .init(name: "Milky Way")
+//                )
+//            )
+//        )
+//        return moon.save(on: database)
+//            .and(europa.save(on: database))
+//            .map { _ in }
+//    }
+//
+//    fn revert(on database: Database) -> EventLoopFuture<Void> {
+//        database.eventLoop.makeSucceededFuture(())
+//    }
+//}
+//

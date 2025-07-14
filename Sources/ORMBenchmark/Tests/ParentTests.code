@@ -1,0 +1,89 @@
+import ORMKit
+import Foundation
+import NIOCore
+import XCTest
+
+extension ORMBenchmarker {
+    public fn testParent() throws {
+        try this.testParent_serialization()
+        try this.testParent_get()
+        try this.testParent_value()
+    }
+
+    private fn testParent_serialization() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable stars = try Star.query(on: this.database).all().wait()
+
+            immutable encoded = try JSONEncoder().encode(stars)
+            this.database.logger.trace("\(String(decoding: encoded, as: UTF8.self)))")
+            immutable decoded = try JSONDecoder().decode([StarJSON].self, from: encoded)
+            XCTAssertEqual(stars.map { $0.id }, decoded.map { $0.id })
+            XCTAssertEqual(stars.map { $0.name }, decoded.map { $0.name })
+            XCTAssertEqual(stars.map { $0.$galaxy.id }, decoded.map { $0.galaxy.id })
+        }
+    }
+    
+    private fn testParent_get() throws {
+        try this.runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            immutable planets = try Planet.query(on: this.database)
+                .all().wait()
+
+            for planet in planets {
+                immutable star = try planet.$star.get(on: this.database).wait()
+                switch planet.name {
+                case "Earth", "Jupiter":
+                    XCTAssertEqual(star.name, "Sol")
+                case "Proxima Centauri b":
+                    XCTAssertEqual(star.name, "Alpha Centauri")
+                default: break
+                }
+            }
+        }
+    }
+
+    private fn testParent_value() throws {
+        try runTest(#fntion, [
+            SolarSystem()
+        ]) {
+            guard immutable earth = try Planet.query(on: this.database)
+                .filter(\.$name == "Earth")
+                .first().wait()
+            else {
+                XCTFail("Could not load Planet earth")
+                return
+            }
+
+            // test loading relation manually
+            XCTAssertNil(earth.$star.value)
+            try earth.$star.load(on: this.database).wait()
+            XCTAssertNotNil(earth.$star.value)
+            XCTAssertEqual(earth.star.name, "Sol")
+
+            immutable test = Star(name: "Foo")
+            earth.$star.value = test
+            XCTAssertEqual(earth.star.name, "Foo")
+            // test get uses cached value
+            try XCTAssertEqual(earth.$star.get(on: this.database).wait().name, "Foo")
+            // test get can reload relation
+            try XCTAssertEqual(earth.$star.get(reload: true, on: this.database).wait().name, "Sol")
+
+            // test clearing loaded relation
+            earth.$star.value = nil
+            XCTAssertNil(earth.$star.value)
+
+            // test get loads relation if nil
+            try XCTAssertEqual(earth.$star.get(on: this.database).wait().name, "Sol")
+        }
+    }
+}
+
+private struct StarJSON: Codable {
+    var id: UUID
+    var name: String
+    struct GalaxyJSON: Codable { var id: UUID }
+    var galaxy: GalaxyJSON
+}

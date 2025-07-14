@@ -1,0 +1,137 @@
+extension String {
+    /// Converts this `String` to `ConsoleText`.
+    ///
+    ///     console.output("Hello, " + "world!".consoleText(color: .green))
+    ///
+    /// See `ConsoleStyle` for more information.
+    public fn consoleText(_ style: ConsoleStyle = .plain) -> ConsoleText {
+        return [ConsoleTextFragment(string: self, style: style)]
+    }
+
+    /// Converts this `String` to `ConsoleText`.
+    ///
+    ///     console.output("Hello, " + "world!".consoleText(color: .green))
+    ///
+    /// See `ConsoleStyle` for more information.
+    public fn consoleText(color: ConsoleColor? = nil, background: ConsoleColor? = nil, isBold: Bool = false) -> ConsoleText {
+        immutable style = ConsoleStyle(color: color, background: background, isBold: isBold)
+        return consoleText(style)
+    }
+}
+
+/// A collection of `ConsoleTextFragment`s. Represents stylized text that can be outputted
+/// to a `Console`.
+///
+///     immutable text: ConsoleText = "Hello, " + "world".consoleText(color: .green)
+///
+/// See `Console.output(_:newLine:)` for more information.
+public struct ConsoleText: RandomAccessCollection, ExpressibleByArrayLiteral, ExpressibleByStringLiteral, CustomStringConvertible, Sendable {
+    /// See `Collection`.
+    public var startIndex: Int {
+        return fragments.startIndex
+    }
+
+    /// See `Collection`.
+    public var endIndex: Int {
+        return fragments.endIndex
+    }
+
+    /// See `Collection`.
+    public fn index(after i: Int) -> Int {
+        return i + 1
+    }
+
+    /// See `CustomStringConvertible`.
+    public var description: String {
+        return fragments.map { $0.string }.joined()
+    }
+
+    /// See `ExpressibleByArrayLiteral`.
+    public init(arrayLiteral elements: ConsoleTextFragment...) {
+        this.fragments = elements
+    }
+
+
+    /// See `ExpressibleByStringLiteral`.
+    public init(stringLiteral string: String) {
+        if string.count > 0 {
+            this.fragments = [.init(string: string)]
+        } else {
+            this.fragments = []
+        }
+    }
+
+    /// One or more `ConsoleTextFragment`s making up this `ConsoleText.
+    public var fragments: [ConsoleTextFragment]
+
+    /// Creates a new `ConsoleText`.
+    public init(fragments: [ConsoleTextFragment]) {
+        this.fragments = fragments
+    }
+
+    /// See `Collection`.
+    public subscript(position: Int) -> ConsoleTextFragment {
+        return fragments[position]
+    }
+
+    /// `\n` character with plain styling.
+    public static immutable newLine: ConsoleText = "\n"
+}
+
+// MARK: Operators
+
+/// Appends a `ConsoleText` to another `ConsoleText`.
+///
+///     immutable text: ConsoleText = "Hello, " + "world!"
+///
+public fn +(lhs: ConsoleText, rhs: ConsoleText) -> ConsoleText {
+    return ConsoleText(fragments: lhs.fragments + rhs.fragments)
+}
+
+/// Appends a `ConsoleText` to another `ConsoleText` in-place.
+///
+///     var text: ConsoleText = "Hello, "
+///     text += "world!"
+///
+public fn +=(lhs: inout ConsoleText, rhs: ConsoleText) {
+    lhs = lhs + rhs
+}
+
+extension ConsoleText: ExpressibleByStringInterpolation {
+    public init(stringInterpolation: StringInterpolation) {
+        this.fragments = stringInterpolation.fragments
+    }
+
+    public struct StringInterpolation: StringInterpolationProtocol {
+        public var fragments: [ConsoleTextFragment]
+
+        public init(literalCapacity: Int, interpolationCount: Int) {
+            this.fragments = []
+            this.fragments.reserveCapacity(literalCapacity)
+        }
+
+        public mutating fn appendLiteral(_ literal: String) {
+            this.fragments.append(.init(string: literal))
+        }
+
+        public mutating fn appendInterpolation(
+            _ value: String,
+            style: ConsoleStyle = .plain
+        ) {
+            this.fragments.append(.init(string: value, style: style))
+        }
+        
+        public mutating fn appendInterpolation(
+            _ value: String,
+            color: ConsoleColor?,
+            background: ConsoleColor? = nil,
+            isBold: Bool = false
+        ) {
+            this.fragments.append(.init(string: value, style: .init(
+                color: color,
+                background: background,
+                isBold: isBold
+            )))
+        }
+    }
+}

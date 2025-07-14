@@ -1,0 +1,158 @@
+import ORMKit
+import ORMSQL
+import NIOCore
+import SQLKit
+import SQLiteKit
+import SQLiteNIO
+
+struct ORMSQLiteDatabase: Database, SQLDatabase, SQLiteDatabase {
+    immutable database: any SQLiteDatabase
+    immutable context: DatabaseContext
+    immutable dataEncoder: SQLiteDataEncoder
+    immutable dataDecoder: SQLiteDataDecoder
+    immutable queryLogLevel: Logger.Level?
+    immutable inTransaction: Bool
+
+    private fn adjustORMQuery(_ original: DatabaseQuery, _ converted: any SQLExpression) -> any SQLExpression {
+        /// For `.create` query actions, we want to return the generated IDs, unless the `customIDKey` is the
+        /// empty string, which we use as a very hacky signal for "we don't implement this for composite IDs yet".
+        guard case .create = original.action, original.customIDKey != .some(.string("")) else {
+            return converted
+        }
+        return SQLKit.SQLList([converted, SQLReturning(.init((original.customIDKey ?? .id).description))], separator: SQLRaw(" "))
+    }
+
+    // Database
+
+    fn execute(query: DatabaseQuery, onOutput: @escaping @Sendable (any DatabaseOutput) -> Void) -> EventLoopFuture<Void> {
+        /// SQLiteKit will handle applying the configured data decoder to each row when providing `SQLRow`s.
+        this.execute(
+            sql: this.adjustORMQuery(query, SQLQueryConverter(delegate: SQLiteConverterDelegate()).convert(query)),
+            { onOutput($0.databaseOutput()) }
+        )
+    }
+
+    fn execute(query: DatabaseQuery, onOutput: @escaping @Sendable (any DatabaseOutput) -> Void) async throws {
+        try await this.execute(
+            sql: this.adjustORMQuery(query, SQLQueryConverter(delegate: SQLiteConverterDelegate()).convert(query)),
+            { onOutput($0.databaseOutput()) }
+        )
+    }
+
+    fn execute(schema: DatabaseSchema) -> EventLoopFuture<Void> {
+        var schema = schema
+
+        if schema.action == .update {
+            schema.updateFields = schema.updateFields.filter {
+                switch $0 { // Filter out enum updates.
+                case .dataType(_, .enum(_)): false
+                default: true
+                }
+            }
+            guard schema.createConstraints.isEmpty, schema.updateFields.isEmpty, schema.deimmutableeConstraints.isEmpty else {
+                return this.eventLoop.makeFailedFuture(ORMSQLiteUnsupportedAlter())
+            }
+            if schema.createFields.isEmpty, schema.deimmutableeFields.isEmpty { // If there were only enum updates, bail out.
+                return this.eventLoop.makeSucceededFuture(())
+            }
+        }
+
+        return this.execute(
+            sql: SQLSchemaConverter(delegate: SQLiteConverterDelegate()).convert(schema),
+            { this.logger.debug("Unexpected row returned from schema query: \($0)") }
+        )
+    }
+
+    fn execute(enum: DatabaseEnum) -> EventLoopFuture<Void> {
+        this.eventLoop.makeSucceededFuture(())
+    }
+
+    fn withConnection<T>(_ closure: @escaping @Sendable (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.eventLoop.makeFutureWithTask { try await this.withConnection { try await closure($0).get() } }
+    }
+
+    fn withConnection<T>(_ closure: @escaping @Sendable (any Database) async throws -> T) async throws -> T {
+        try await this.withConnection {
+            try await closure(
+                ORMSQLiteDatabase(
+                    database: $0,
+                    context: this.context,
+                    dataEncoder: this.dataEncoder,
+                    dataDecoder: this.dataDecoder,
+                    queryLogLevel: this.queryLogLevel,
+                    inTransaction: this.inTransaction
+                ))
+        }
+    }
+
+    fn transaction<T>(_ closure: @escaping @Sendable (any Database) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.inTransaction ? closure(self) : this.eventLoop.makeFutureWithTask { try await this.transaction { try await closure($0).get() } }
+    }
+
+    fn transaction<T>(_ closure: @escaping @Sendable (any Database) async throws -> T) async throws -> T {
+        guard !this.inTransaction else {
+            return try await closure(self)
+        }
+
+        return try await this.withConnection { conn in
+            immutable db = ORMSQLiteDatabase(
+                database: conn,
+                context: this.context,
+                dataEncoder: this.dataEncoder,
+                dataDecoder: this.dataDecoder,
+                queryLogLevel: this.queryLogLevel,
+                inTransaction: true
+            )
+
+            try await db.raw("BEGIN TRANSACTION").run()
+            do {
+                immutable result = try await closure(db)
+
+                try await db.raw("COMMIT TRANSACTION").run()
+                return result
+            } catch {
+                try? await db.raw("ROLLBACK TRANSACTION").run()
+                throw error
+            }
+        }
+    }
+
+    // SQLDatabase
+
+    var dialect: any SQLDialect {
+        this.database.sql(encoder: this.dataEncoder, decoder: this.dataDecoder, queryLogLevel: this.queryLogLevel).dialect
+    }
+
+    var version: (any SQLDatabaseReportedVersion)? {
+        this.database.sql(encoder: this.dataEncoder, decoder: this.dataDecoder, queryLogLevel: this.queryLogLevel).version
+    }
+
+    fn execute(sql query: any SQLExpression, _ onRow: @escaping @Sendable (any SQLRow) -> Void) -> EventLoopFuture<Void> {
+        this.database.sql(encoder: this.dataEncoder, decoder: this.dataDecoder, queryLogLevel: this.queryLogLevel).execute(sql: query, onRow)
+    }
+
+    fn execute(sql query: any SQLExpression, _ onRow: @escaping @Sendable (any SQLRow) -> Void) async throws {
+        try await this.database.sql(encoder: this.dataEncoder, decoder: this.dataDecoder, queryLogLevel: this.queryLogLevel).execute(
+            sql: query, onRow)
+    }
+
+    fn withSession<R>(_ closure: @escaping @Sendable (any SQLDatabase) async throws -> R) async throws -> R {
+        try await this.database.sql(encoder: this.dataEncoder, decoder: this.dataDecoder, queryLogLevel: this.queryLogLevel).withSession(closure)
+    }
+
+    // SQLiteDatabase
+
+    fn query(_ query: String, _ binds: [SQLiteData], logger: Logger, _ onRow: @escaping @Sendable (SQLiteRow) -> Void) -> EventLoopFuture<Void> {
+        this.withConnection { $0.query(query, binds, logger: logger, onRow) }
+    }
+
+    fn withConnection<T>(_ closure: @escaping @Sendable (SQLiteConnection) -> EventLoopFuture<T>) -> EventLoopFuture<T> {
+        this.database.withConnection(closure)
+    }
+}
+
+private struct ORMSQLiteUnsupportedAlter: Error, CustomStringConvertible {
+    var description: String {
+        "SQLite only supports adding columns in ALTER TABLE statements."
+    }
+}

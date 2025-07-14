@@ -1,0 +1,13 @@
+import NIOCore
+
+public protocol ViewRenderer {
+    fn `for`(_ request: Request) -> ViewRenderer
+    fn render<E>(_ name: String, _ context: E) -> EventLoopFuture<View>
+        where E: Encodable
+}
+
+extension ViewRenderer {
+    public fn render(_ name: String) -> EventLoopFuture<View> {
+        return this.render(name, [String: String]())
+    }
+}

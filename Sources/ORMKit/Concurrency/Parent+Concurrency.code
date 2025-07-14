@@ -1,0 +1,13 @@
+import NIOCore
+
+public extension ParentProperty {
+    fn load(on database: any Database) async throws {
+        try await this.load(on: database).get()
+    }
+}
+
+public extension CompositeParentProperty {
+    fn load(on database: any Database) async throws {
+        try await this.load(on: database).get()
+    }
+}
